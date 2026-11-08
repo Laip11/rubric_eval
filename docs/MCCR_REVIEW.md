@@ -85,10 +85,10 @@
 2. **参考答案引导的 Direct**（G 的回答作参考）和 **G=J 设置**：P1 的归因对照。
 3. **LLM Rubrics w/o resp. / w. resp.**（单次调用；RRD 表中的标准基线）：等价于"只用 MCCR 先验视图"和"一次调用看全部探测"，检验多视图聚类是否有必要。
 4. **Chasing the Tail RTD** [2509.21500](https://arxiv.org/abs/2509.21500)（ICLR 2026）/ [代码](https://github.com/Jun-Kai-Zhang/rubrics)：基于探测对的差异做细化，属于响应驱动准则的强基线。
-5. **OpenRubrics CRG** [2510.07743](https://arxiv.org/abs/2510.07743) / [模型与数据](https://huggingface.co/OpenRubrics)：硬规则/原则二分，对应 MCCR 的 core/ext。推理时用探测对代替带标签的 chosen/rejected 做 prompt 版复现，另外把 Rubric-RM-8B 作为训练型参考行。
+5. **OpenRubrics CRG** [2510.07743](https://arxiv.org/abs/2510.07743) / [模型与数据](https://huggingface.co/OpenRubrics)：硬规则/原则二分，对应 MCCR 的 core/ext。推理时用探测对代替带标签的 chosen/rejected 做 prompt 版复现（只比较 training-free 方法，不使用 Rubric-RM）。
 6. **Self-consistency / SPCT 式原则 + 批评 + 投票@k** [2504.02495](https://arxiv.org/abs/2504.02495)：算力对齐下的推理时扩展对照。
 
-**可选**：RLCF candidate-based checklist [2507.18624](https://arxiv.org/abs/2507.18624) / [代码](https://github.com/viswavi/RLCF)；MRRG [2607.01830](https://arxiv.org/abs/2607.01830)（多角色准则聚合，无代码，可按描述 prompt 复现）；TICK [2410.03608](https://arxiv.org/abs/2410.03608)；RocketEval [2503.05142](https://arxiv.org/abs/2503.05142)；Prometheus 2 [2405.01535](https://arxiv.org/abs/2405.01535)；RM-R1 [2505.02387](https://arxiv.org/abs/2505.02387)；来源论文 Dynamic Rubrics [2605.30568](https://arxiv.org/abs/2605.30568)（作者提供了 DPO 生成器 checkpoint）；PAOR（作为自身消融）。
+**可选**：RLCF candidate-based checklist [2507.18624](https://arxiv.org/abs/2507.18624) / [代码](https://github.com/viswavi/RLCF)；MRRG [2607.01830](https://arxiv.org/abs/2607.01830)（多角色准则聚合，无代码，可按描述 prompt 复现）；TICK [2410.03608](https://arxiv.org/abs/2410.03608)；RocketEval [2503.05142](https://arxiv.org/abs/2503.05142)；来源论文 Dynamic Rubrics [2605.30568](https://arxiv.org/abs/2605.30568)（只比较其 training-free 部分）；PAOR（作为自身消融）。**比较范围限定为 training-free 方法**，Prometheus 2、RM-R1、Rubric-RM、DeepSeek-GRM 等训练型裁判不纳入比较。
 
 **证明必要性的强启发式（作为消融，不进主表）**：①全部视图取并集、不聚类、均匀权重；②聚类后全部候选均匀加权，不做残差筛选；③随机 L 条 / Top-variance L 条；④线性聚合 vs PAOR 缺陷带 vs 门控；⑤RaR 式 LLM 标签代替频率支持度；⑥RRD 白化代替 Gram-Schmidt；⑦N∈{2,4,6,8,12}。
 
@@ -155,4 +155,4 @@
 | §4 统计 | 主方法对全部其他方法做 McNemar 检验和配对 bootstrap，并做 Holm 校正；3 个 seed 的运行命令 | `run_main.significance_against_all` |
 | H1 准则覆盖 | 计算 RubricBench 专家准则的召回率、精确率和冗余率 | `rubric_recall.py` |
 
-**尚未实现：** RLCF、MRRG、TICK、RocketEval、Prometheus 2 的接入；训练型参考行（Rubric-RM、DeepSeek-GRM）；准则级 pairwise 平局处理（建议 1.3 第 4 条中的第一步）；Best-of-N / GRPO 下游实验。
+**尚未实现：** RLCF、MRRG、TICK、RocketEval、Dynamic Rubrics training-free 部分的完整复现；准则级 pairwise 平局处理（建议 1.3 第 4 条中的第一步）；Best-of-N / GRPO 下游实验。
