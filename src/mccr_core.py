@@ -289,3 +289,103 @@ def hierarchical_aggregate(
     else:
         raise ValueError(f"Unknown aggregation mode {mode}")
     return {"U": utility, "S_core": s_core, "S_ext": s_ext, "core_weights": core_weights, "ext_weights": ext_weights}
+
+
+# ---------------------------------------------------------------------------
+# MCCR-ME primitives: grounding, view-origin classes, hitting sets, deletion minimisation.
+# ---------------------------------------------------------------------------
+
+ME_PRIORITY = {"explicit": 3, "both": 2, "query_implicit": 1, "response_only": 0, "sufficiency": 0}
+
+
+def _normalise(text: str) -> str:
+    return " ".join(str(text).lower().split())
+
+
+def span_in_query(evidence: str | None, query: str, min_chars: int = 3) -> bool:
+    """True when an "explicit" criterion's evidence is really a (whitespace/case-normalised) span of the query."""
+    if not evidence:
+        return False
+    evidence = _normalise(evidence).strip(" \"'“”.,;:")
+    return len(evidence) >= min_chars and evidence in _normalise(query)
+
+
+def classify_clusters(clusters: list[dict[str, Any]], U: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Assign each semantic cluster to the query/response comparison classes.
+
+    * ``explicit``        a query-view member is stated in the query (verified evidence span);
+    * ``both``            query view and at least one response view proposed it (Q∩R);
+    * ``query_implicit``  only the query view proposed it and it is not explicitly stated (Q-only);
+    * ``response_only``   only response views proposed it (R-only).
+
+    The representative keeps query-grounded wording: the verified explicit member for ``explicit``,
+    the medoid when it is a query-view member, otherwise the first query-view member; response-only
+    clusters use the medoid.
+    """
+    output = []
+    for cluster_id, cluster in enumerate(clusters):
+        members = [U[j] for j in cluster["members"]]
+        prior = [x for x in members if int(x["view"]) == 0]
+        responses = {int(x["view"]) for x in members if int(x["view"]) > 0}
+        explicit = [x for x in prior if x.get("type") == "explicit" and span_in_query(x.get("evidence"), query)]
+        if explicit:
+            label, representative = "explicit", explicit[0]
+        elif prior and responses:
+            label, representative = "both", prior[0]
+        elif prior:
+            label, representative = "query_implicit", prior[0]
+        else:
+            label, representative = "response_only", U[cluster["medoid"]]
+        if prior and U[cluster["medoid"]] in prior:
+            representative = U[cluster["medoid"]] if label != "explicit" else representative
+        output.append({"id": f"E{cluster_id + 1}", "criterion": representative["criterion"], "class": label,
+                       "cluster_id": cluster_id, "evidence": representative.get("evidence") if label == "explicit" else None,
+                       "response_support": float(cluster.get("response_support", 0.0)),
+                       "n_response_views": len(responses), "rho": float(cluster.get("rho", 0.0))})
+    return output
+
+
+def greedy_hitting_set(F: np.ndarray, known_pairs: list[tuple[int, int]], *, tau_align: float = 0.05
+                       ) -> tuple[list[int], dict[str, Any]]:
+    """Smallest (greedy, ln-approximate) set of criteria explaining every known-ordered pair.
+
+    Each pair (better, worse) defines a conflict set {c : F[better, c] > F[worse, c]}. Criteria whose
+    mean signed gap is below ``-tau_align`` prefer the worse response and are excluded (RRD-style).
+    Pairs no remaining criterion separates are reported as unexplained. Dual of Reiter's minimal
+    diagnoses: a minimal explanation is a minimal hitting set of the conflict sets.
+    """
+    F = np.asarray(F, dtype=float)
+    if F.ndim != 2 or F.shape[1] == 0:
+        return [], {"unexplained_pairs": len(known_pairs), "misaligned": []}
+    alignment = directional_alignment(F, known_pairs) if known_pairs else np.zeros(F.shape[1])
+    allowed = {c for c in range(F.shape[1]) if alignment[c] >= -tau_align}
+    conflict = [{c for c in allowed if F[b, c] > F[w, c]} for b, w in known_pairs]
+    uncovered = {i for i, values in enumerate(conflict) if values}
+    unexplained = sum(1 for values in conflict if not values)
+    selected: list[int] = []
+    while uncovered:
+        best = max(sorted(allowed - set(selected)), key=lambda c: sum(c in conflict[i] for i in uncovered), default=None)
+        if best is None or not any(best in conflict[i] for i in uncovered):
+            break
+        selected.append(best)
+        uncovered = {i for i in uncovered if best not in conflict[i]}
+    return selected, {"unexplained_pairs": unexplained, "misaligned": sorted(set(range(F.shape[1])) - allowed),
+                      "alignment": alignment.tolist()}
+
+
+def deletion_minimize(items: list[dict[str, Any]], implied_by: dict[str, list[str]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Linear deletion-based minimisation (as for minimal unsatisfiable subsets).
+
+    Items are visited from lowest to highest priority (``ME_PRIORITY`` then support). An item is deleted
+    when it is implied by criteria that are all still kept; deleting in this order means a mutually
+    implying pair keeps its higher-priority member and cycles cannot delete both.
+    """
+    order = sorted(items, key=lambda x: (ME_PRIORITY.get(x.get("class", ""), 0), x.get("response_support", 0.0), x["id"]))
+    kept = {x["id"] for x in items}
+    removed = []
+    for item in order:
+        sources = [s for s in implied_by.get(item["id"], []) if s != item["id"]]
+        if sources and all(s in kept for s in sources):
+            kept.discard(item["id"])
+            removed.append({"id": item["id"], "criterion": item["criterion"], "implied_by": sources})
+    return [x for x in items if x["id"] in kept], removed

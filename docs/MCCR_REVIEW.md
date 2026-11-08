@@ -156,3 +156,5 @@
 | H1 准则覆盖 | 计算 RubricBench 专家准则的召回率、精确率和冗余率 | `rubric_recall.py` |
 
 **尚未实现：** RLCF、MRRG、TICK、RocketEval、Dynamic Rubrics training-free 部分的完整复现；准则级 pairwise 平局处理（建议 1.3 第 4 条中的第一步）；Best-of-N / GRPO 下游实验。
+
+**2026-11-08 追加：** 按用户确定的“最小证据集合”思路，新增主方法 `mccr_me`（`src/mccr_me.py`，规范见 `new_our_method.md` §5），包括 query/response 视图对比分类、见证必要性检验、去冗余和反例充分性检验。v1/v2 保留为前作和消融。

@@ -97,6 +97,48 @@ def summarize(rows: list[dict[str, Any]], groups: list[dict[str, Any]]) -> dict[
     }
 
 
+ME_CLASSES = ["explicit", "both", "query_implicit", "response_only"]
+
+
+def summarize_me(rows: list[dict[str, Any]], groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Minimal-evidence diagnostics: class mix, necessity pass rates, deduplication, sufficiency."""
+    pass_rate: dict[str, list[float]] = {label: [] for label in ME_CLASSES}
+    in_E: dict[str, list[float]] = {label: [] for label in ME_CLASSES + ["sufficiency"]}
+    reasons: Counter = Counter()
+    for row in rows:
+        classes = {x["id"]: x["class"] for x in row.get("candidates", [])}
+        for cid, test in (row.get("tests") or {}).items():
+            if classes.get(cid) in pass_rate:
+                pass_rate[classes[cid]].append(float(bool(test.get("necessary"))))
+            reasons[test.get("reason", "unknown")] += 1
+        for item in row.get("E", []):
+            in_E[item.get("class", "sufficiency")].append(1.0)
+    pairs = [p for g in groups for p in g.get("pairs", []) if p.get("gold") in ("A", "B")]
+    fallback = [p for p in pairs if p.get("fallback")]
+    accuracy = lambda values: mean([float(p.get("prediction") == p["gold"]) for p in values])
+    sufficiency = [row.get("sufficiency", {}) for row in rows if row.get("sufficiency", {}).get("enabled")]
+    total_candidates = sum(len(row.get("candidates", [])) for row in rows)
+    return {
+        "n_queries": len(rows), "accuracy": accuracy(pairs),
+        "mean_candidates": mean([float(len(row.get("candidates", []))) for row in rows]),
+        "mean_E": mean([float(len(row.get("E", []))) for row in rows]),
+        **{f"share_{label}": (sum(row.get("class_counts", {}).get(label, 0) for row in rows) / total_candidates
+                              if total_candidates else None) for label in ME_CLASSES},
+        **{f"necessity_pass_{label}": mean(values) for label, values in pass_rate.items()},
+        **{f"E_from_{label}": sum(values) / len(rows) if rows else None for label, values in in_E.items()},
+        "test_reasons": dict(reasons),
+        "mean_budget_dropped": mean([float(len(row.get("budget_dropped", []))) for row in rows]),
+        "mean_dedup_removed": mean([float(len(row.get("dedup_removed", []))) for row in rows]),
+        "share_me_fallback": mean([float(bool(row.get("me_fallback"))) for row in rows]),
+        "counterexample_rate": mean([float(bool(x.get("counterexample"))) for x in sufficiency]),
+        "mean_sufficiency_added": mean([float(len([c for c in row.get("E", []) if c.get("class") == "sufficiency"]))
+                                        for row in rows]),
+        "fallback_rate": len(fallback) / len(pairs) if pairs else None,
+        "fallback_accuracy": accuracy(fallback),
+        "mean_valid_probes": mean([float(row.get("n_valid_probes") or 0) for row in rows]),
+    }
+
+
 def fmt(value: Any) -> str:
     if value is None:
         return "—"
@@ -108,17 +150,22 @@ def fmt(value: Any) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--methods", nargs="+", default=["mccr", "mccr_v2"])
+    parser.add_argument("--methods", nargs="+", default=["mccr", "mccr_v2", "mccr_me"])
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     report: dict[str, Any] = {}
+    me_report: dict[str, Any] = {}
     for path in sorted((args.output_root / "diagnostics").glob(f"*.seed{args.seed}.jsonl")):
         benchmark, method = path.name.split(".")[:2]
         if method not in args.methods:
             continue
         result_path = args.output_root / benchmark / method / f"seed{args.seed}.json"
         groups = json.loads(result_path.read_text(encoding="utf-8"))["groups"] if result_path.exists() else []
-        report.setdefault(benchmark, {})[method] = summarize(load_jsonl(path), groups)
+        rows = load_jsonl(path)
+        if method.startswith("mccr_me"):
+            me_report.setdefault(benchmark, {})[method] = summarize_me(rows, groups)
+        else:
+            report.setdefault(benchmark, {})[method] = summarize(rows, groups)
     keys = ["n_queries", "accuracy", "share_L_prime_zero", "mean_K", "mean_candidates", "share_rank_saturated",
             "core_share_with_prior", "core_share_prior_echoed_once", "core_share_response_only",
             "prior_clusters_in_core", "fallback_rate", "fallback_accuracy", "non_fallback_accuracy",
@@ -134,8 +181,21 @@ def main() -> None:
             lines.append(f"\n`{name}` L′ distribution: {methods[name]['L_prime_distribution']}; "
                          f"core-rank distribution: {methods[name]['core_rank_distribution']}")
         lines.append("")
+    if me_report:
+        lines += ["# MCCR-ME (minimal evidence set) diagnostics", "",
+                  "Classes: explicit = stated in the query (verified span); both = query view and ≥1 response view; "
+                  "query_implicit = query view only; response_only = response views only.", ""]
+        for benchmark, methods in me_report.items():
+            names = list(methods)
+            lines += [f"## {benchmark} (ME)", "", "| metric | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
+            for key in [k for k in methods[names[0]] if k != "test_reasons"]:
+                lines.append(f"| {key} | " + " | ".join(fmt(methods[n].get(key)) for n in names) + " |")
+            for name in names:
+                lines.append(f"\n`{name}` necessity-test outcomes: {methods[name]['test_reasons']}")
+            lines.append("")
     (args.output_root / "MCCR_DIAGNOSTICS.md").write_text("\n".join(lines), encoding="utf-8")
-    (args.output_root / "mccr_diagnostics.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    (args.output_root / "mccr_diagnostics.json").write_text(json.dumps({"mccr": report, "mccr_me": me_report}, indent=2,
+                                                                       ensure_ascii=False), encoding="utf-8")
     print(args.output_root / "MCCR_DIAGNOSTICS.md")
 
 

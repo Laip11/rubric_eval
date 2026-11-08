@@ -150,7 +150,14 @@ def parse_rubrics(text: str, key: str, min_count: int, max_count: int) -> list[d
         else:
             continue
         if criterion:
-            rubrics.append({"id": rid, "criterion": criterion})
+            entry = {"id": rid, "criterion": criterion}
+            if isinstance(item, dict):
+                # Optional grounding fields used by MCCR-ME; ignored by every other caller.
+                if str(normalized.get("type", "")).strip().lower() in {"explicit", "implicit"}:
+                    entry["type"] = str(normalized["type"]).strip().lower()
+                if isinstance(normalized.get("evidence"), str) and normalized["evidence"].strip():
+                    entry["evidence"] = normalized["evidence"].strip()
+            rubrics.append(entry)
     if len(rubrics) < min_count:
         raise ValueError(f"rubric count {len(rubrics)} below {min_count}")
     return rubrics

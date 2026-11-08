@@ -52,6 +52,8 @@ Output ONLY JSON: {{"covered": ["X1", ...], "matched_generated": ["G2", ...]}}''
 def criteria_from_diagnostic(method: str, diagnostic: dict[str, Any]) -> list[str]:
     if not diagnostic:
         return []
+    if diagnostic.get("method") == "mccr_me":  # minimal evidence set
+        return [x["criterion"] for x in diagnostic.get("E", [])]
     if "R_core" in diagnostic:  # MCCR v1/v2
         return [x["criterion"] for x in diagnostic.get("R_core", []) + diagnostic.get("R_ext", [])]
     if "criteria" in diagnostic and isinstance(diagnostic["criteria"], dict):  # probe rubric runners

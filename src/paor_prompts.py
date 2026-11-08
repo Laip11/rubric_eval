@@ -288,3 +288,124 @@ DIRECT_POINT10_SYSTEM = '''You are an objective evaluator. Score the response fr
 SPCT_SYSTEM = '''You are a skilled evaluator of AI assistant responses. First write the evaluation principles that matter most for this specific query (with weights), then critique each response against those principles, and finally give each response an integer score from 1 to 10. End your answer with exactly one line of the form:
 Scores: \\boxed{s1, s2}'''
 SPCT_USER = '''[Query]\n{query}\n\n[Response 1]\n{response_a}\n\n[Response 2]\n{response_b}'''
+
+# ---------------------------------------------------------------------------
+# MCCR-ME (minimal evidence set) prompts; see new_our_method.md §5.
+# ---------------------------------------------------------------------------
+
+PROMPT_ME_PRIOR = '''You are an expert evaluation architect. Given a user query, list EVERY requirement that an
+excellent response to this query must satisfy.
+
+Coverage — include all that apply:
+- explicit instructions and constraints (content, format, length, language, style, audience);
+- implicit premises and essential sub-goals needed to actually fulfil the request;
+- correctness and completeness of what is asked;
+- safety or refusal boundaries when relevant.
+
+Granularity — keep each criterion at the level of a REQUIREMENT:
+- merge sub-points of the same requirement into one criterion;
+- do not write implementation details, specific expected answers, worked solutions or examples;
+- each criterion must be checkable from the response alone, positively phrased, and must not
+  duplicate or paraphrase another criterion.
+
+Grounding — for every criterion give:
+- "type": "explicit" if the query states it, otherwise "implicit";
+- "evidence": for explicit criteria, the exact words copied verbatim from the query that state it;
+  for implicit criteria, an empty string.
+
+Do not use a fixed number: write as many criteria as the query genuinely requires.
+
+### User Query:
+{query}
+
+Output ONLY valid JSON:
+{{"prior_rubrics": [{{"id": "P1", "criterion": "<one requirement>", "type": "explicit", "evidence": "<verbatim query words>"}}]}}'''
+
+PROMPT_WITNESS = '''You are constructing a controlled test case for an evaluation rubric.
+
+Rewrite the Base Response so that it VIOLATES the target criterion below while still SATISFYING every
+other listed criterion and keeping everything else (content, length, tone, formatting) as close to the
+Base Response as possible. Do not mention or hint at the violation.
+
+If the target criterion cannot be violated without also violating some of the other criteria (because
+those criteria already imply it), output exactly one line:
+IMPOSSIBLE: <comma-separated IDs of the other criteria that would also be violated>
+
+### User Query:
+{query}
+
+### Criterion to violate:
+{criterion}
+
+### Other criteria (keep satisfied):
+{others}
+
+### Base Response:
+{response}
+
+Output ONLY the rewritten response (or the IMPOSSIBLE line).'''
+
+PROMPT_ENTAILMENT = '''Below is a list of evaluation criteria for one user query. A criterion is REDUNDANT if every
+response that satisfies the listed other criteria necessarily satisfies it too (it is implied by them),
+or if it restates another criterion. Be conservative: only mark a criterion redundant when the
+implication is clear, and name the criteria that imply it.
+
+### User Query:
+{query}
+
+### Criteria list:
+{criteria}
+
+Output ONLY valid JSON:
+{{"redundant": [{{"id": "<redundant ID>", "implied_by": ["<ID>", "..."]}}]}}
+Use {{"redundant": []}} if none is redundant.'''
+
+PROMPT_NECESSITY_JUDGMENT = '''For each evaluation criterion below, consider a response to the user query that satisfies
+ALL the other criteria but violates this one. Would such a response be unacceptable or clearly worse for
+the user? Answer true if the criterion is genuinely necessary, false if violating it alone would not make
+the response worse.
+
+### User Query:
+{query}
+
+### Criteria list:
+{criteria}
+
+Output ONLY valid JSON mapping every ID to true or false, e.g. {{"necessary": {{"C1": true, "C2": false}}}}'''
+
+PROMPT_ADVERSARY = '''You are stress-testing an evaluation rubric. Write a response to the user query that satisfies
+EVERY requirement in the rubric below, yet is clearly WORSE for the user than the Reference Response
+because of a flaw that the rubric does not check (for example a subtle error, an unsupported claim, a
+missing essential element, or an unhelpful approach). Keep a similar length and style. Do not mention the
+flaw.
+
+### User Query:
+{query}
+
+### Rubric:
+{criteria}
+
+### Reference Response:
+{response}
+
+Output ONLY the response.'''
+
+PROMPT_MISSING_REQUIREMENT = '''The Adversarial Response below satisfies every requirement of the current rubric but is
+worse than the Reference Response. Identify the requirement(s) of the user query that the adversarial
+response fails and that the rubric is missing. Write each as one requirement-level, positively phrased,
+checkable criterion about the task (not about these specific responses). Usually one is enough.
+
+### User Query:
+{query}
+
+### Current Rubric:
+{criteria}
+
+### Reference Response:
+{reference}
+
+### Adversarial Response:
+{adversarial}
+
+Output ONLY valid JSON:
+{{"missing_requirements": [{{"id": "M1", "criterion": "<requirement>"}}]}}'''

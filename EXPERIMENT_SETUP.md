@@ -29,7 +29,7 @@ COMMON="--backend offline --model-path $J --strong-model qwen35-9b \
 方法组：
 
 ```bash
-MAIN="mccr_v2 mccr paor direct direct_point direct_k sc_principles direct_ref \
+MAIN="mccr_me mccr_v2 mccr paor direct direct_point direct_k sc_principles direct_ref \
   rubric_query rubric_resp rrd rrd_uniform crg rtd checkeval rubrichub"
 ```
 
@@ -94,7 +94,7 @@ python src/run_main.py $COMMON \
 
 python src/rubric_recall.py --output-root outputs/v2_main_gj \
   --embedding-model $M/Qwen3-Embedding-0.6B \
-  --methods mccr_v2 mccr paor rrd rrd_uniform rubric_query rubric_resp crg rtd checkeval rubrichub
+  --methods mccr_me mccr_v2 mccr paor rrd rrd_uniform rubric_query rubric_resp crg rtd checkeval rubrichub
 ```
 
 如需 LLM 匹配器（更可靠），先启动一个 OpenAI 兼容服务，然后加 `--matcher llm --endpoint http://127.0.0.1:8000/v1 --model <served-name>`。
@@ -135,6 +135,23 @@ python src/run_main.py $ABL --method-suffix _legacyviews --view-prompts legacy  
 
 `--N` 不同时探测签名也不同，会重新生成探测，这一点在设计上是有意的。v1 组件的消融可用 `--methods mccr --method-suffix ...` 实现，同样的参数会作用到 v1 上。旧的 `src/mccr_coverage_ablation.py`（只调 τ_core / τ_var / L）仍可用于 v1。
 
+## 6b. MCCR-ME 消融
+
+```bash
+MEABL="$COMMON --generator-model-path $J --generator-model qwen35-9b --role-params strong=9 generator=9 weak=7 \
+  --benchmarks rewardbench2 helpsteer3 llmbar rubricbench --methods mccr_me --seeds 0 \
+  --output-root outputs/v2_ablation --cache-root cache/v2_ablation"
+python src/run_main.py $MEABL --split test                                                   # witness + sufficiency
+python src/run_main.py $MEABL --split test --method-suffix _judg    --me-necessity judgment
+python src/run_main.py $MEABL --split test --method-suffix _hit     --me-necessity hitting_set
+python src/run_main.py $MEABL --split test --method-suffix _nonec   --me-necessity none
+python src/run_main.py $MEABL --split test --method-suffix _nosuff  --me-sufficiency off
+python src/run_main.py $MEABL --split test --method-suffix _T6      --me-max-tests 6
+python src/mccr_diagnostics.py --output-root outputs/v2_ablation
+```
+
+RubricBench 和 LLMBar 没有 dev 划分，跑消融时请对它们单独使用 `--split all`。诊断报告中的 `share_*`、`necessity_pass_*`、`E_from_*`、`counterexample_rate` 分别回答以下问题：最小证据集合中的准则来自哪一类视图，以及隐含准则通过必要性检验的比例。
+
 ## 7. 准确率–算力曲线
 
 ```bash
@@ -143,6 +160,7 @@ CURVE="$COMMON --generator-model-path $J --generator-model qwen35-9b --role-para
   --output-root outputs/v2_compute --cache-root cache/v2_compute"
 for k in 2 4 8 16 32; do python src/run_main.py $CURVE --methods direct_k --direct-k $k; done
 for k in 1 4 8 16; do python src/run_main.py $CURVE --methods sc_principles --sc-k $k; done
+for t in 4 8 12; do python src/run_main.py $CURVE --methods mccr_me --me-max-tests $t --method-suffix _T$t; done
 for n in 4 6 8 12; do python src/run_main.py $CURVE --methods mccr_v2 rrd --N $n --n-counterfactual $((n / 2)) --method-suffix _N$n; done
 ```
 
@@ -152,7 +170,7 @@ for n in 4 6 8 12; do python src/run_main.py $CURVE --methods mccr_v2 rrd --N $n
 
 ```bash
 python src/summarize_results.py --output-root outputs/v2_main_gj
-python src/mccr_diagnostics.py  --output-root outputs/v2_main_gj --methods mccr mccr_v2
+python src/mccr_diagnostics.py  --output-root outputs/v2_main_gj --methods mccr mccr_v2 mccr_me
 ```
 
 `SUMMARY.md` 包含以下内容：strict / lenient 准确率、RB2 best-of-4、位置一致率、fallback 及其子集准确率、分子集准确率、RM-Bench Hard/Normal/Easy、调用数、token、参数加权 token，以及 `<primary>_vs_all.json` 中经 Holm 校正的配对检验。

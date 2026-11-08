@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 
 from async_vllm import AsyncLLMPool, check_endpoints
 from baselines import BaselineRunner
+from mccr_me import MinimalEvidencePipeline
 from mccr_pipeline import MCCRPipeline
 from metrics import (aggregate_seed_metrics, compute_metrics, holm_correction, mcnemar, pair_metadata,
                      paired_accuracy_bootstrap, paired_bootstrap_difference)
@@ -29,12 +30,13 @@ from rubric_baselines import PROBE_RUBRIC_METHODS, ProbeRubricRunner
 LOG = logging.getLogger("paor-main")
 DEFAULT_METHODS = ["direct", "checkeval", "dna", "rubrichub", "mccr", "direct_k"]
 RUBRIC_METHODS = [*PROBE_RUBRIC_METHODS, "rrd_uniform"]
-METHOD_CHOICES = [*DEFAULT_METHODS, "mccr_v2", "paor", "dynamic", "direct_point", "sc_principles", *RUBRIC_METHODS]
+METHOD_CHOICES = [*DEFAULT_METHODS, "mccr_me", "mccr_v2", "paor", "dynamic", "direct_point", "sc_principles", *RUBRIC_METHODS]
 # Methods that read probes (always through the shared ProbeStore so they see identical probes).
-PROBE_METHODS = {"paor", "mccr", "mccr_v2", "rubric_resp", "rrd", "rrd_uniform", "crg", "rtd", "direct_ref"}
+PROBE_METHODS = {"paor", "mccr", "mccr_v2", "mccr_me", "rubric_resp", "rrd", "rrd_uniform", "crg", "rtd", "direct_ref"}
 GENERATOR_METHODS = PROBE_METHODS | {"dynamic", "checkeval", "dna", "rubrichub", "rubric_query"}
 # expert_rubric needs neither generator nor probes: it reads the benchmark's human rubric.
-PRIMARY_ORDER = ["mccr_v2", "mccr", "paor"]
+PRIMARY_ORDER = ["mccr_me", "mccr_v2", "mccr", "paor"]
+MCCR_FAMILY = {"mccr", "mccr_v2", "mccr_me"}
 
 
 def endpoints(value: str | list[str] | None) -> list[str]:
@@ -119,6 +121,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-collinearity", type=float, default=0.9)
     parser.add_argument("--lex-c", type=float, default=0.8)
     parser.add_argument("--method-suffix", default="", help="appended to MCCR output names for ablation runs")
+    # MCCR-ME (minimal evidence set) options.
+    parser.add_argument("--me-necessity", choices=["witness", "judgment", "hitting_set", "none"], default="witness",
+                        help="necessity estimator for implicit / response-only criteria")
+    parser.add_argument("--me-max-tests", type=int, default=12, help="max criteria per query that receive a necessity test")
+    parser.add_argument("--me-sufficiency", choices=["on", "off"], default="on",
+                        help="one round of counterexample search for missing requirements")
     # Baseline options.
     parser.add_argument("--sc-k", type=int, default=8, help="samples for sc_principles (SPCT-style voting@k)")
     parser.add_argument("--direct-k", type=int, default=None, help="explicit k for direct_k (output name direct_k<k>)")
@@ -217,7 +225,7 @@ async def run(args: argparse.Namespace) -> None:
         pool = AsyncLLMPool(strong, weak, generator, strong_model=args.strong_model, weak_model=args.weak_model,
                             generator_model=args.generator_model, max_concurrency=args.max_concurrency,
                             per_replica_concurrency=args.per_replica_concurrency)
-    needs_embeddings = bool({"paor", "mccr", "mccr_v2", "rrd", "rrd_uniform"} & set(args.methods))
+    needs_embeddings = bool({"paor", "mccr", "mccr_v2", "mccr_me", "rrd", "rrd_uniform"} & set(args.methods))
     embedding_fn = make_embedding(args.embedding_model) if needs_embeddings else None
     baseline = BaselineRunner(pool, args.cache_root, tokenizer=tokenizer,
                               query_max_tokens=args.query_max_tokens,
@@ -303,6 +311,19 @@ async def run(args: argparse.Namespace) -> None:
 
             mccr = make_mccr("v1") if "mccr" in args.methods else None
             mccr_v2 = make_mccr("v2") if "mccr_v2" in args.methods else None
+            me_options = {"necessity": args.me_necessity, "max_tests": args.me_max_tests,
+                          "sufficiency": args.me_sufficiency == "on"}
+            mccr_me = MinimalEvidencePipeline(
+                pool, args.cache_root, embedding_fn=embedding_fn, tokenizer=tokenizer, N=args.N,
+                probe_max_tokens=args.probe_max_tokens, query_max_tokens=args.query_max_tokens,
+                response_max_tokens=args.response_max_tokens, probe_max_attempts=args.probe_max_attempts,
+                theta_sim=args.theta_sim, beta=args.beta, tau_align=args.tau_align,
+                n_counterfactual=args.n_counterfactual, method_name="mccr_me" + args.method_suffix,
+                probe_store=store, **protocol, **me_options,
+                cache_signature=json.dumps({**cache_common, "method": "mccr_me" + args.method_suffix,
+                                            "theta_sim": args.theta_sim, "beta": args.beta,
+                                            "tau_align": args.tau_align, **me_options}, sort_keys=True)
+            ) if "mccr_me" in args.methods else None
             rubric_runners = {
                 method: ProbeRubricRunner(pool, args.cache_root, method="rrd" if method == "rrd_uniform" else method,
                                           rrd_weighting="uniform" if method == "rrd_uniform" else "whiten",
@@ -318,7 +339,7 @@ async def run(args: argparse.Namespace) -> None:
             def output_name(method: str) -> str:
                 if method == "paor" and args.ablation != "none":
                     return f"paor_{args.ablation}"
-                if method in {"mccr", "mccr_v2"}:
+                if method in MCCR_FAMILY:
                     return method + args.method_suffix
                 if method == "direct_k" and args.direct_k:
                     return f"direct_k{args.direct_k}"
@@ -354,10 +375,15 @@ async def run(args: argparse.Namespace) -> None:
                             results = await mccr.run(benchmark, selected, seed=seed)
                         elif method == "mccr_v2":
                             results = await mccr_v2.run(benchmark, selected, seed=seed)
+                        elif method == "mccr_me":
+                            results = await mccr_me.run(benchmark, selected, seed=seed)
                         elif method in rubric_runners:
                             results = await rubric_runners[method].run(benchmark, selected, seed=seed)
                         else:
-                            if "mccr_v2" in args.methods:  # prior + probes + views + counterfactuals + score rows
+                            if "mccr_me" in args.methods:
+                                # prior + probes + views + ~3 calls per tested criterion + dedup + sufficiency (~6)
+                                direct_budget = 1 + 2 * args.N + 3 * args.me_max_tests // 2 + 1 + 6
+                            elif "mccr_v2" in args.methods:  # prior + probes + views + counterfactuals + score rows
                                 n_cf = min(args.n_counterfactual, (args.N + 1) // 2)
                                 direct_budget = 1 + 3 * args.N + 2 * n_cf
                             elif "mccr" in args.methods:
@@ -369,7 +395,7 @@ async def run(args: argparse.Namespace) -> None:
                                                          sc_k=args.sc_k)
                         save_json(output_path, {"benchmark": benchmark, "method": method_name, "seed": seed,
                                                 "split": args.split, "groups": results})
-                        if method in {"paor", "mccr", "mccr_v2"} or method in rubric_runners:
+                        if method in {"paor", *MCCR_FAMILY} or method in rubric_runners:
                             diagnostic_path = args.output_root / "diagnostics" / f"{benchmark}.{method_name}.seed{seed}.jsonl"
                             diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
                             with diagnostic_path.open("w", encoding="utf-8") as f:
@@ -409,7 +435,8 @@ async def run(args: argparse.Namespace) -> None:
                         save_json(args.output_root / benchmark / f"{primary}_vs_strongest.json",
                                   {"method": primary, "baseline": strongest,
                                    "significance": comparisons["comparisons"][strongest]})
-            for first, second in [("mccr_v2", "mccr"), ("mccr", "paor"), ("mccr_v2", "rrd")]:
+            for first, second in [("mccr_me", "mccr_v2"), ("mccr_me", "rrd"), ("mccr_me", "rubric_query"),
+                                  ("mccr_v2", "mccr"), ("mccr", "paor"), ("mccr_v2", "rrd")]:
                 a = args.output_root / benchmark / output_name(first) / "seed0.json"
                 b = args.output_root / benchmark / output_name(second) / "seed0.json"
                 if first in args.methods and second in args.methods and a.exists() and b.exists():
