@@ -22,7 +22,7 @@ W=$M/Qwen2.5-7B-Instruct   # 弱探测
 COMMON="--backend offline --model-path $J --strong-model qwen35-9b \
   --weak-model-path $W --weak-model qwen25-7b \
   --judge-gpus 0 1 2 3 4 5 --generator-gpus 0 1 2 3 4 5 --weak-gpus 0 1 2 3 4 5 \
-  --score-mode discrete --missing-policy fail --probe-recovery simple \
+  --missing-policy fail --probe-recovery simple \
   --bootstrap 1000 --skip-existing"
 ```
 
@@ -129,7 +129,8 @@ python src/run_main.py $ABL --method-suffix _support    --mccr-core-weighting su
 python src/run_main.py $ABL --method-suffix _uniform    --mccr-core-weighting uniform
 python src/run_main.py $ABL --method-suffix _gated      --mccr-aggregation gated
 python src/run_main.py $ABL --method-suffix _linear     --mccr-aggregation linear
-for n in 2 4 8; do python src/run_main.py $ABL --method-suffix _N$n --N $n; done
+for n in 4 6 12; do python src/run_main.py $ABL --method-suffix _N$n --N $n --n-counterfactual $((n / 2)); done   # 默认 N=8
+python src/run_main.py $ABL --method-suffix _legacyviews --view-prompts legacy   # 旧的计数式视图 prompt
 ```
 
 `--N` 不同时探测签名也不同，会重新生成探测，这一点在设计上是有意的。v1 组件的消融可用 `--methods mccr --method-suffix ...` 实现，同样的参数会作用到 v1 上。旧的 `src/mccr_coverage_ablation.py`（只调 τ_core / τ_var / L）仍可用于 v1。
@@ -142,7 +143,7 @@ CURVE="$COMMON --generator-model-path $J --generator-model qwen35-9b --role-para
   --output-root outputs/v2_compute --cache-root cache/v2_compute"
 for k in 2 4 8 16 32; do python src/run_main.py $CURVE --methods direct_k --direct-k $k; done
 for k in 1 4 8 16; do python src/run_main.py $CURVE --methods sc_principles --sc-k $k; done
-for n in 2 4 6 8; do python src/run_main.py $CURVE --methods mccr_v2 rrd --N $n --method-suffix _N$n; done
+for n in 4 6 8 12; do python src/run_main.py $CURVE --methods mccr_v2 rrd --N $n --n-counterfactual $((n / 2)) --method-suffix _N$n; done
 ```
 
 以每个方法的 `param_tokens_per_sample`（或 `avg_*_tokens_per_sample`）为横轴、`accuracy` 为纵轴作图。注意：`rrd` 的输出名不带 N 后缀，若要把不同 N 的 `rrd` 都放进同一张图，需为每个 N 使用不同的 `--output-root`。
@@ -171,7 +172,7 @@ python -m compileall -q src
 ```
 
 测试覆盖以下内容：
-- 协议：离散/软分数、缺失即失败、简单探测恢复、共享探测成本；
+- 协议：只用离散分数（CLI 中已无 logprob 选项）、缺失即失败、简单探测恢复、共享探测成本、多探测 prompt 的上下文截断；
 - MCCR v2：方向对齐、Ledoit–Wolf 白化、对比式选择、词典序保证，以及 v1/v2 的端到端运行；
 - 新 baseline：RRD 错向过滤、CRG、RTD、rubric_*、direct_ref、expert、SPCT 投票、direct_point；
 - 新指标：lenient、best-of-N、分子集、RM-Bench 风格矩阵、FLOPs 代理指标、Holm 校正、配对 bootstrap；

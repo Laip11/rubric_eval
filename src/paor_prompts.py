@@ -16,11 +16,61 @@ Rules:
 Output ONLY valid JSON:
 {{"prior_rubrics": [{{"id": "P1", "criterion": "<one checkable requirement>"}}]}}'''
 
-PROMPT_MCCR_PRIOR_BASIS = PROMPT_PRIOR_BASIS.replace(
+# MCCR views (current): coverage first, requirement-level granularity, no fixed number of criteria.
+PROMPT_MCCR_PRIOR_BASIS = '''You are an expert evaluation architect. Given a user query, list EVERY requirement that an
+excellent response to this query must satisfy.
+
+Coverage — include all that apply:
+- explicit instructions and constraints (content, format, length, language, style, audience);
+- implicit premises and essential sub-goals needed to actually fulfil the request;
+- correctness and completeness of what is asked;
+- safety or refusal boundaries when relevant.
+
+Granularity — keep each criterion at the level of a REQUIREMENT:
+- merge sub-points of the same requirement into one criterion;
+- do not write implementation details, specific expected answers, worked solutions or examples;
+- each criterion must be checkable from the response alone, positively phrased, and must not
+  duplicate or paraphrase another criterion.
+
+Do not use a fixed number: write as many criteria as the query genuinely requires (one is fine for a
+single-requirement query; complex queries may need many). Avoid generic filler such as "is helpful".
+
+### User Query:
+{query}
+
+Output ONLY valid JSON:
+{{"prior_rubrics": [{{"id": "P1", "criterion": "<one requirement>"}}]}}'''
+
+PROMPT_RESPONSE_ATOMIC = '''You are an expert evaluation architect. Given a user query and one sample response, write
+evaluation criteria for judging ANY response to this query.
+
+Use the sample to reveal requirements that may not be obvious from the query alone: implicit expectations,
+typical failure modes or pitfalls, and qualities that separate excellent from mediocre answers. Cover all
+such requirements this view reveals, together with the essential requirements of the query.
+
+Granularity and wording:
+- keep each criterion at the level of a requirement; merge sub-points of the same requirement;
+- write criteria about the task, never about this particular sample (no quotes, no sample-specific wording);
+- do not reward length or formatting unless the query requires them;
+- each criterion must be independently checkable, positively phrased, and not repeat another one.
+
+Do not use a fixed number: write as many criteria as this view genuinely supports.
+
+### User Query:
+{query}
+
+### Sample Response:
+{response}
+
+Output ONLY valid JSON:
+{{"response_rubrics": [{{"id": "R1", "criterion": "<one requirement>"}}]}}'''
+
+# Legacy MCCR view prompts (counted, minimal sets); kept only to reproduce pre-2026-11-08 results.
+PROMPT_MCCR_PRIOR_BASIS_LEGACY = PROMPT_PRIOR_BASIS.replace(
     "Use 2 to 5 criteria.",
     "Use 1 to 5 criteria. Use exactly one for a single independent requirement; add more only when independently necessary.")
 
-PROMPT_RESPONSE_ATOMIC = '''You are an expert evaluation architect. Given a user query and one sample response, identify the MINIMAL set of atomic criteria needed to judge responses to this query.
+PROMPT_RESPONSE_ATOMIC_LEGACY = '''You are an expert evaluation architect. Given a user query and one sample response, identify the MINIMAL set of atomic criteria needed to judge responses to this query.
 
 Use the sample only to reveal important requirements, subtle failure modes, or valuable qualities that may not be obvious from the query alone. Do not write criteria about this particular sample's wording, and do not reward length or formatting unless the query requires them.
 

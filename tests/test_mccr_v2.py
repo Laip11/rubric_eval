@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -73,10 +74,12 @@ class ScriptedPool:
             a = user.split("[Response A]\n", 1)[1].split("\n\n[Response B]", 1)[0]
             return '{"winner":"A"}' if "GOOD" in a else '{"winner":"B"}'
         if '"prior_rubrics"' in user:
-            return '{"prior_rubrics": [{"id": "P1", "criterion": "answer quality is high"}]}'
+            extra = ", ".join(f'{{"id": "P{j}", "criterion": "prior requirement {j} quality"}}' for j in range(2, 8))
+            return '{"prior_rubrics": [{"id": "P1", "criterion": "answer quality is high"}, ' + extra + ']}'
         if '"response_rubrics"' in user:
+            extra = ", ".join(f'{{"id": "R{j}", "criterion": "view requirement {j} quality"}}' for j in range(4, 10))
             return ('{"response_rubrics": [{"id": "R1", "criterion": "answer quality is high"}, '
-                    '{"id": "R2", "criterion": "verbose style"}, {"id": "R3", "criterion": "detail quality"}]}')
+                    '{"id": "R2", "criterion": "verbose style"}, {"id": "R3", "criterion": "detail quality"}, ' + extra + ']}')
         if '"hard_rules"' in user:
             return ('{"hard_rules": [{"id": "H1", "criterion": "answer quality is high"}], '
                     '"principles": [{"id": "Q1", "criterion": "detail quality"}]}')
@@ -165,20 +168,56 @@ class ProtocolTest(unittest.TestCase):
         self.assertTrue(tie["fallback"])
         self.assertEqual(decide_pair(pair, {"r0": 0.6, "r1": 0.5})["prediction"], "A")
 
-    def test_discrete_score_mode_ignores_logprobs_and_resolves_missing(self):
+    def test_discrete_scores_and_missing_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline = PAORPipeline(ScriptedPool(), tmp, embedding_fn=embed, N=1)
             text = '{"C1": {"reason": "r", "score": 1}}'
-            entries = [{"token": '{"C1": {"reason": "r", "score": ', "logprob": 0, "top_logprobs": []},
-                       {"token": "1", "logprob": -0.1, "top_logprobs": [{"token": "2", "logprob": -0.2}, {"token": "1", "logprob": -0.1}]}]
-            values, missing = pipeline._score_values(LLMResult(text, entries, 1, 1, 0.0, "x"), ["C1", "C2"])
+            values, missing = pipeline._score_values(LLMResult(text, [], 1, 1, 0.0, "x"), ["C1", "C2"])
             self.assertEqual(values, [0.5, None])
             self.assertEqual(missing, 1)
             self.assertIsNone(pipeline._resolve_missing(values))
             neutral = PAORPipeline(ScriptedPool(), tmp, embedding_fn=embed, N=1, missing_policy="neutral")
             self.assertEqual(neutral._resolve_missing(values), [0.5, 0.5])
-            soft = PAORPipeline(ScriptedPool(), tmp, embedding_fn=embed, N=1, score_mode="logprob")
-            self.assertGreater(soft._score_values(LLMResult(text, entries, 1, 1, 0.0, "x"), ["C1"])[0][0], 0.5)
+            with self.assertRaises(TypeError):
+                PAORPipeline(ScriptedPool(), tmp, embedding_fn=embed, N=1, score_mode="logprob")
+
+    def test_cli_has_no_logprob_option_and_defaults_to_eight_probes(self):
+        import run_main
+        argv = sys.argv
+        try:
+            sys.argv = ["run_main"]
+            args = run_main.parse_args()
+            self.assertFalse(hasattr(args, "score_mode"))
+            self.assertEqual(args.N, 8)
+            self.assertEqual(args.n_counterfactual, 4)
+            self.assertEqual(args.view_prompts, "coverage")
+            sys.argv = ["run_main", "--score-mode", "logprob"]
+            with self.assertRaises(SystemExit):
+                run_main.parse_args()
+        finally:
+            sys.argv = argv
+
+    def test_judge_requests_never_ask_for_logprobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = ScriptedPool()
+            store = ProbeStore(pool, tmp, embedding_fn=embed, N=4, cache_signature="s")
+            pipeline = MCCRPipeline(pool, tmp, embedding_fn=embed, N=4, variant="v2", probe_store=store)
+            asyncio.run(pipeline.run("rewardbench2", [pair_group()], seed=0))
+        self.assertTrue(pool.requests)
+        self.assertFalse(any(request.get("logprobs") for request in pool.requests))
+
+    def test_fit_probes_truncates_only_when_needed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = PAORPipeline(ScriptedPool(), tmp, embedding_fn=embed, N=8, query_max_tokens=100,
+                                    generator_max_model_len=100 + 512 + 1024 + 8 * 256)
+            cache = {}
+            short = ["a" * 400] * 8  # ~100 tokens each under the 4-chars-per-token fallback
+            self.assertEqual(pipeline._fit_probes(cache, short, 512), short)
+            self.assertNotIn("probe_prompt_truncated", cache)
+            long = ["b" * 8000] * 8
+            fitted = pipeline._fit_probes(cache, long, 512)
+            self.assertTrue(all(len(x) <= 256 * 4 for x in fitted))
+            self.assertEqual(cache["probe_prompt_truncated"], 1)
 
     def test_simple_recovery_drops_exhausted_probe_slot(self):
         class TruncatingPool(ScriptedPool):
@@ -238,6 +277,30 @@ class MCCRV2Test(unittest.TestCase):
         self.assertEqual(result["pairs"][0]["prediction"], "A")
         self.assertGreater(result["cost"]["calls"], 0)
         self.assertIn("tokens:generator", result["cost"])
+
+    def test_views_are_not_count_limited_and_n8_shapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = ScriptedPool()
+            store = ProbeStore(pool, tmp, embedding_fn=embed, N=8, cache_signature="s")
+            pipeline = MCCRPipeline(pool, tmp, embedding_fn=embed, N=8, variant="v2", probe_store=store)
+            result = asyncio.run(pipeline.run("rewardbench2", [pair_group()], seed=0))[0]
+        diagnostic = result["diagnostic"]
+        views = Counter(item["view"] for item in diagnostic["U"])
+        self.assertEqual(views[0], 7)  # > old cap of 5
+        self.assertTrue(all(views[m] == 9 for m in range(1, 9)))  # > old cap of 6
+        self.assertEqual(len(diagnostic["score_rows"]), 12)  # 8 probes + 4 counterfactuals
+        self.assertEqual(len(diagnostic["known_pairs"]), 4 * 4 + 4)
+
+    def test_legacy_view_prompts_keep_old_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = ScriptedPool()
+            store = ProbeStore(pool, tmp, embedding_fn=embed, N=4, cache_signature="s")
+            pipeline = MCCRPipeline(pool, tmp, embedding_fn=embed, N=4, variant="v1", probe_store=store,
+                                    view_prompts="legacy")
+            result = asyncio.run(pipeline.run("rewardbench2", [pair_group()], seed=0))[0]
+        views = Counter(item["view"] for item in result["diagnostic"]["U"])
+        self.assertEqual(views[0], 5)
+        self.assertEqual(views[1], 6)
 
     def test_v1_runs_on_the_fixed_protocol(self):
         result, _ = self.run_mccr("v1")

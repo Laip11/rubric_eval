@@ -94,21 +94,6 @@ def pairwise_decide(U_a: float, U_b: float, eps: float = 1e-4) -> str:
     return "fallback"
 
 
-def expected_score(logprobs: dict[int, float] | None, discrete: int | float = 1) -> float:
-    """Normalize available 0/1/2 logprobs and return E[score]/2."""
-    if not logprobs:
-        return float(discrete) / 2.0
-    values = np.array([logprobs.get(i, -np.inf) for i in range(3)], dtype=float)
-    finite = np.isfinite(values)
-    if not finite.any():
-        return float(discrete) / 2.0
-    values = values[finite]
-    values = np.exp(values - values.max())
-    probs = values / values.sum()
-    levels = np.arange(3, dtype=float)[finite]
-    return float(np.dot(probs, levels) / 2.0)
-
-
 def extract_json(text: str) -> Any:
     """Parse JSON from raw text or a fenced code block."""
     text = text.strip()
@@ -213,59 +198,6 @@ def parse_atomic_scores(text: str, criterion_ids: list[str]) -> tuple[dict[str, 
     fields = _score_fields(text)
     scores = {cid: value for cid in criterion_ids if (value := _field_for_id(fields, cid)) is not None}
     return scores, len(criterion_ids) - len(scores)
-
-
-def _score_field_position(text: str, cid: str) -> int | None:
-    patterns = [r'"([^"]+)"\s*:\s*\{[^{}]*?"score"\s*:\s*', r'"([^"]+)"\s*:\s*"?']
-    suffix = re.search(r"(\d+)$", cid)
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.DOTALL):
-            key = match.group(1)
-            if key == cid or (suffix and re.search(r"(\d+)$", key) and re.search(r"(\d+)$", key).group(1) == suffix.group(1)):
-                return match.end()
-    return None
-
-
-def parse_score_token_logprobs(text: str, token_entries: list[dict[str, Any]], criterion_ids: list[str]) -> dict[str, dict[int, float]]:
-    """Map the first token after each score field to its top-logprob candidates."""
-    if not token_entries:
-        return {}
-    pieces = [str(entry.get("token", "")) for entry in token_entries]
-    offsets = []
-    cursor = 0
-    for piece in pieces:
-        offsets.append((cursor, cursor + len(piece)))
-        cursor += len(piece)
-    result: dict[str, dict[int, float]] = {}
-    for cid in criterion_ids:
-        position = _score_field_position(text, cid)
-        if position is None:
-            continue
-        token_index = next((i for i, (start, end) in enumerate(offsets) if start <= position < end), None)
-        if token_index is None:
-            token_index = next((i for i, (start, end) in enumerate(offsets) if start >= position), None)
-        if token_index is None:
-            continue
-        entry = token_entries[token_index]
-        candidates: dict[int, float] = {}
-        for top in entry.get("top_logprobs", []) or []:
-            token = str(top.get("token", "")).strip()
-            number = re.match(r"^([012])(?:\D|$)", token)
-            if number:
-                candidates[int(number.group(1))] = float(top.get("logprob", -np.inf))
-        own_token = pieces[token_index].strip()
-        number = re.match(r"^([012])(?:\D|$)", own_token)
-        if number and "logprob" in entry:
-            candidates.setdefault(int(number.group(1)), float(entry["logprob"]))
-        if candidates:
-            result[cid] = candidates
-    return result
-
-
-def softmax_expected_from_entries(text: str, entries: list[dict[str, Any]], criterion_ids: list[str], discrete: dict[str, int]) -> tuple[dict[str, float], dict[str, dict[int, float]]]:
-    logprobs = parse_score_token_logprobs(text, entries, criterion_ids)
-    values = {cid: expected_score(logprobs.get(cid), discrete.get(cid, 1)) for cid in criterion_ids}
-    return values, logprobs
 
 
 def unit_defect_band(K: int, c: float = 0.8) -> tuple[float, float]:

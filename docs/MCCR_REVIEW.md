@@ -140,7 +140,7 @@
 
 | 报告项 | 实施内容 | 位置 |
 |---|---|---|
-| P1 打分分辨率不对等 | `--score-mode discrete` 为默认值，所有准则方法统一使用离散分数；logprob 只能在所有方法都使用时开启 | `paor_pipeline.PAORPipeline._score_values` |
+| P1 打分分辨率不对等 | 彻底移除 logprob，所有准则方法只用离散分数 | `paor_pipeline.PAORPipeline._score_values` |
 | P1 解析失败被静默中和 | `--missing-policy fail` 为默认值：目标回答有准则缺失时直接计 parse error，不再按 0.5 处理 | `_resolve_missing`, `decide_pair` |
 | P1 强模型探测相当于参考答案 | 新增 `direct_ref`（以探测作参考答案）；主设置改为 G = J；共享探测 | `rubric_baselines.py`, `ProbeStore` |
 | P1 判定协议与算力不对等 | 所有分数型方法共用同一个 fallback；记录按角色拆分的 token 和参数加权 token；新增 strict / lenient 两种口径；提供准确率–算力曲线的运行命令 | `metrics.py`, `EXPERIMENT_SETUP.md` §7 |

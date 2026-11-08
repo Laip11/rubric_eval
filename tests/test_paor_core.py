@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from paor_core import (aggregate, expected_score, pairwise_decide, parse_atomic_scores, parse_rubrics, select_posterior,
-                       softmax_expected_from_entries, unit_defect_band)
+from paor_core import (aggregate, pairwise_decide, parse_atomic_scores, parse_rubrics, select_posterior,
+                       unit_defect_band)
 from mccr_core import gated_aggregate, orthogonal_residual_select, semantic_consensus_clusters
 from mccr_coverage_ablation import build_variant_cache
 from paor_data import drop_human_ties, group_from_pairs_for_mock, load_records, make_groups
@@ -43,21 +43,6 @@ class PAORCoreTest(unittest.TestCase):
         self.assertGreater(ua[0], ub[0])
         eta, delta = unit_defect_band(4)
         self.assertLess(eta, delta)
-
-    def test_expected_score(self):
-        self.assertAlmostEqual(expected_score({0: 0.0, 1: 0.0, 2: 0.0}), 0.5)
-        self.assertAlmostEqual(expected_score(None, 2), 1.0)
-
-    def test_logprob_extraction(self):
-        text = '{"P1": {"reason": "ok", "score": 2}}'
-        entries = [
-            {"token": '{"P1": {"reason": "ok", "score": ', "logprob": -0.1, "top_logprobs": []},
-            {"token": "2", "logprob": -0.1, "top_logprobs": [{"token": "0", "logprob": -5}, {"token": "1", "logprob": -4}, {"token": "2", "logprob": -0.1}]},
-            {"token": "}}", "logprob": -0.1, "top_logprobs": []},
-        ]
-        values, logprobs = softmax_expected_from_entries(text, entries, ["P1"], {"P1": 2})
-        self.assertIn("P1", logprobs)
-        self.assertGreater(values["P1"], 0.9)
 
     def test_score_id_aliases_and_multiple_objects(self):
         text = '{"P1": {"reason": "ok", "score": 2}}\n{"P2": {"reason": "partial", "score": 1}}'

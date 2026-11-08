@@ -102,8 +102,7 @@ class ProbeRubricRunner(PAORPipeline):
             user = PROMPT_ATOMIC_JUDGE.format(query=self._q(groups[i]), response=self._r(text),
                                               criteria_list_formatted=format_criteria(criteria))
             requests.append(self._request(JUDGE_SYSTEM, user, self._tag(seed, groups[i]["qid"], "none"),
-                                          temperature=0.0, max_tokens=self.judge_max_tokens,
-                                          logprobs=self.score_mode == "logprob"))
+                                          temperature=0.0, max_tokens=self.judge_max_tokens))
         if not requests:
             return []
         raw = await self.pool.complete_many(requests)
@@ -146,7 +145,7 @@ class ProbeRubricRunner(PAORPipeline):
             if self.method == "rubric_query":
                 items.append((i, PROMPT_QUERY_RUBRIC.format(query=self._q(group))))
             else:
-                probes = [text for _, text in valid_probes(cache)]
+                probes = self._fit_probes(cache, [text for _, text in valid_probes(cache)], 1536)
                 items.append((i, PROMPT_RESP_RUBRIC.format(query=self._q(group), probes=format_probes(probes))))
         generated = await self._generate_rubrics(items, groups, seed) if items else {}
         for i, values in generated.items():
@@ -243,7 +242,8 @@ class ProbeRubricRunner(PAORPipeline):
             return
         proposals = await self._generate_rubrics(
             [(i, PROMPT_RESP_RUBRIC.format(query=self._q(groups[i]),
-                                           probes=format_probes([t for _, t in valid_probes(caches[i])])))
+                                           probes=format_probes(self._fit_probes(
+                                               caches[i], [t for _, t in valid_probes(caches[i])], 1536))))
              for i in todo], groups, seed)
         counter = {i: 0 for i in todo}
 
@@ -257,7 +257,7 @@ class ProbeRubricRunner(PAORPipeline):
         rejected = {i: 0 for i in todo}
         decomposed: dict[int, set[str]] = {i: set() for i in todo}
         log: dict[int, list[dict[str, Any]]] = {i: [] for i in todo}
-        satisfied_at = 0.75 if self.score_mode == "logprob" else 0.999
+        satisfied_at = 0.999  # criterion fully satisfied (discrete score 2/2)
         for round_index in range(self.rrd_rounds + 1):
             active = {i: values for i, values in pending.items() if values}
             if not active:
@@ -308,7 +308,7 @@ class ProbeRubricRunner(PAORPipeline):
             # Decompose over-satisfied criteria (one call per criterion keeps the parent link).
             items, owners = [], []
             for i, parents in next_pending.items():
-                probes = format_probes([t for _, t in valid_probes(caches[i])])
+                probes = format_probes(self._fit_probes(caches[i], [t for _, t in valid_probes(caches[i])], 1024))
                 for parent in parents:
                     items.append((i, PROMPT_RRD_DECOMPOSE.format(query=self._q(groups[i]), criterion=parent["criterion"],
                                                                  probes=probes)))

@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-max-tokens", type=int, default=4096)
     parser.add_argument("--probe-max-tokens", type=int, default=4096)
     parser.add_argument("--probe-max-attempts", type=int, default=7)
-    parser.add_argument("--N", type=int, default=6)
+    parser.add_argument("--N", type=int, default=8, help="probes per query (half strong generator, half weak)")
     parser.add_argument("--L", type=int, default=4)
     parser.add_argument("--paor-c", type=float, default=0.8)
     parser.add_argument("--tau-d", type=float, default=0.15)
@@ -96,10 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rho-min", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=2.0)
     parser.add_argument("--eta", type=float, default=0.5)
-    parser.add_argument("--ablation", default="none", choices=["none", "prior_only", "post_only", "no_selection", "random_select", "disc_only", "flat_mean", "discrete_score"])
+    parser.add_argument("--ablation", default="none", choices=["none", "prior_only", "post_only", "no_selection", "random_select", "disc_only", "flat_mean"])
     # Protocol (fairness) settings shared by every rubric-scoring method.
-    parser.add_argument("--score-mode", choices=["discrete", "logprob"], default="discrete",
-                        help="criterion scores for ALL rubric methods; baselines are discrete, so keep discrete for main tables")
     parser.add_argument("--missing-policy", choices=["fail", "neutral"], default="fail",
                         help="'fail' counts a target response with unparsable criteria as a parse error (like every baseline)")
     parser.add_argument("--probe-recovery", choices=["full", "simple"], default="simple",
@@ -114,7 +112,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mccr-aggregation", choices=["gated", "lexicographic", "linear"])
     parser.add_argument("--mccr-contrast", choices=["none", "roles", "counterfactual", "both"])
     parser.add_argument("--mccr-filter-core", choices=["on", "off"])
-    parser.add_argument("--n-counterfactual", type=int, default=3)
+    parser.add_argument("--n-counterfactual", type=int, default=4, help="degraded copies of strong probes (N/2 = all)")
+    parser.add_argument("--view-prompts", choices=["coverage", "legacy"], default="coverage",
+                        help="MCCR view prompts: coverage-oriented without criterion counts, or the legacy counted prompts")
     parser.add_argument("--tau-align", type=float, default=0.05)
     parser.add_argument("--max-collinearity", type=float, default=0.9)
     parser.add_argument("--lex-c", type=float, default=0.8)
@@ -157,7 +157,9 @@ def trim_pairs(groups: list[dict], max_pairs: int | None) -> None:
 async def run(args: argparse.Namespace) -> None:
     multi_probe = {"paor", "rubric_resp", "rrd", "rrd_uniform"} & set(args.methods)
     if multi_probe and args.generator_max_model_len < args.query_max_tokens + args.N * args.probe_max_tokens + 2048:
-        raise ValueError(f"generator-max-model-len is too small for prompts holding all probes ({sorted(multi_probe)})")
+        LOG.warning("Prompts holding all %d probes may exceed generator-max-model-len=%d for %s; probes are truncated "
+                    "to equal shares only when needed and counted in probe_prompt_truncated",
+                    args.N, args.generator_max_model_len, sorted(multi_probe))
     role_params = {}
     for item in args.role_params:
         role, _, value = item.partition("=")
@@ -238,10 +240,6 @@ async def run(args: argparse.Namespace) -> None:
             tie_pairs_removed = sum(pair["gold"] == "tie" for group in selected for pair in group["pairs"])
             selected = drop_human_ties(selected)
             trim_pairs(selected, args.max_pairs_per_query)
-            rubric_methods = {"mccr", "mccr_v2", "paor", *RUBRIC_METHODS} & set(args.methods)
-            if (args.score_mode == "logprob" and selected and selected[0]["kind"] == "pointwise" and rubric_methods
-                    and set(args.methods) - rubric_methods):
-                raise ValueError("logprob scores are only comparable when every method uses them; use --score-mode discrete")
             if not selected:
                 raise ValueError(f"No evaluation samples remain for {benchmark} after applying the label protocol")
             LOG.info("%s: %d records, %d selected queries (%d responses, %d pairs)", benchmark, len(records), len(selected),
@@ -254,19 +252,20 @@ async def run(args: argparse.Namespace) -> None:
                                                   "tie_pairs_removed": tie_pairs_removed,
                                                   "evaluation_protocol": "fixed_non_tie_denominator"}
             save_json(args.output_root / "manifest.json", manifest)
-            protocol = {"score_mode": args.score_mode, "missing_policy": args.missing_policy,
+            protocol = {"missing_policy": args.missing_policy,
                         "probe_recovery": args.probe_recovery, "min_probes": args.min_probes}
             manifest["protocol"] = {**protocol, "shared_probes": not args.no_share_probes, "role_params": role_params}
             probe_kwargs = dict(N=args.N, probe_max_tokens=args.probe_max_tokens, query_max_tokens=args.query_max_tokens,
                                 response_max_tokens=args.response_max_tokens, probe_max_attempts=args.probe_max_attempts,
-                                tokenizer=tokenizer, embedding_fn=embedding_fn, **protocol)
+                                tokenizer=tokenizer, embedding_fn=embedding_fn,
+                                generator_max_model_len=args.generator_max_model_len, **protocol)
             probe_signature = json.dumps({"version": "shared-probes-v1", "generator": args.generator_model or str(args.generator_model_path),
                                           "weak": args.weak_model, "N": args.N, "probe_max_tokens": args.probe_max_tokens,
                                           "query_max_tokens": args.query_max_tokens, "probe_recovery": args.probe_recovery,
                                           "probe_max_attempts": args.probe_max_attempts}, sort_keys=True)
             store = (ProbeStore(pool, args.cache_root, cache_signature=probe_signature, **probe_kwargs)
                      if PROBE_METHODS & set(args.methods) and not args.no_share_probes else None)
-            cache_common = {"version": "mccr-v7-fair-protocol", **protocol, "shared_probes": store is not None, "generator": args.generator_model or str(args.generator_model_path),
+            cache_common = {"version": "mccr-v8-coverage-n8", **protocol, "shared_probes": store is not None, "generator": args.generator_model or str(args.generator_model_path),
                             "judge": args.strong_model, "weak": args.weak_model, "embedding": args.embedding_model,
                             "N": args.N, "L": args.L, "probe_max_tokens": args.probe_max_tokens,
                             "query_max_tokens": args.query_max_tokens, "response_max_tokens": args.response_max_tokens}
@@ -274,7 +273,7 @@ async def run(args: argparse.Namespace) -> None:
                                 N=args.N, L=args.L, c=args.paor_c, tau_d=args.tau_d, tau_rho=args.tau_rho, lam=args.lam,
                                 probe_max_tokens=args.probe_max_tokens, query_max_tokens=args.query_max_tokens,
                                 response_max_tokens=args.response_max_tokens, probe_max_attempts=args.probe_max_attempts,
-                                probe_store=store, **protocol,
+                                probe_store=store, generator_max_model_len=args.generator_max_model_len, **protocol,
                                 cache_signature=json.dumps({**cache_common, "method": "paor", "c": args.paor_c,
                                                             "tau_d": args.tau_d, "tau_rho": args.tau_rho, "lam": args.lam}, sort_keys=True)
                                 ) if "paor" in args.methods else None
@@ -282,12 +281,13 @@ async def run(args: argparse.Namespace) -> None:
                             "aggregation": args.mccr_aggregation, "contrast": args.mccr_contrast,
                             "filter_core": None if args.mccr_filter_core is None else args.mccr_filter_core == "on",
                             "n_counterfactual": args.n_counterfactual, "tau_align": args.tau_align,
-                            "max_collinearity": args.max_collinearity, "lex_c": args.lex_c}
+                            "max_collinearity": args.max_collinearity, "lex_c": args.lex_c,
+                            "view_prompts": args.view_prompts}
 
             def make_mccr(variant: str) -> MCCRPipeline:
                 name = ("mccr" if variant == "v1" else "mccr_v2") + args.method_suffix
                 options = mccr_options if variant == "v2" or args.method_suffix else {
-                    key: value for key, value in mccr_options.items() if key in {"n_counterfactual", "tau_align", "max_collinearity", "lex_c"}}
+                    key: value for key, value in mccr_options.items() if key in {"n_counterfactual", "tau_align", "max_collinearity", "lex_c", "view_prompts"}}
                 return MCCRPipeline(pool, args.cache_root, embedding_fn=embedding_fn, tokenizer=tokenizer,
                                     N=args.N, L=args.L, probe_max_tokens=args.probe_max_tokens,
                                     query_max_tokens=args.query_max_tokens, response_max_tokens=args.response_max_tokens,
@@ -357,7 +357,13 @@ async def run(args: argparse.Namespace) -> None:
                         elif method in rubric_runners:
                             results = await rubric_runners[method].run(benchmark, selected, seed=seed)
                         else:
-                            direct_budget = (1 + 3 * args.N) if {"mccr", "mccr_v2"} & set(args.methods) else (2 + 2 * args.N)
+                            if "mccr_v2" in args.methods:  # prior + probes + views + counterfactuals + score rows
+                                n_cf = min(args.n_counterfactual, (args.N + 1) // 2)
+                                direct_budget = 1 + 3 * args.N + 2 * n_cf
+                            elif "mccr" in args.methods:
+                                direct_budget = 1 + 3 * args.N
+                            else:
+                                direct_budget = 2 + 2 * args.N
                             results = await baseline.run(method, benchmark, selected, seed=seed,
                                                          direct_budget=direct_budget, direct_k=args.direct_k,
                                                          sc_k=args.sc_k)
