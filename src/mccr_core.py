@@ -129,3 +129,163 @@ def gated_aggregate(
     utility = s_core + eta * np.power(s_core, gamma) * s_ext
     return {"U": utility, "S_core": s_core, "S_ext": s_ext,
             "core_weights": core_weights, "ext_weights": ext_weights}
+
+
+# ---------------------------------------------------------------------------
+# MCCR v2 primitives: directional (weakly supervised) selection and whitening.
+# ---------------------------------------------------------------------------
+
+def directional_alignment(F: np.ndarray, known_pairs: list[tuple[int, int]]) -> np.ndarray:
+    """Mean signed score gap F[better] - F[worse] per criterion over known-ordered probe pairs.
+
+    ``known_pairs`` holds (better_row, worse_row) indices, e.g. (strong probe, weak probe) or
+    (original probe, counterfactually degraded copy). Values lie in [-1, 1]; a negative value
+    means the criterion prefers the presumably worse response (RRD-style misalignment).
+    """
+    F = np.asarray(F, dtype=float)
+    if F.ndim != 2:
+        raise ValueError("F must be 2-D")
+    if not known_pairs:
+        return np.zeros(F.shape[1])
+    better = np.asarray([b for b, _ in known_pairs], dtype=int)
+    worse = np.asarray([w for _, w in known_pairs], dtype=int)
+    return (F[better] - F[worse]).mean(axis=0)
+
+
+def ledoit_wolf_covariance(X: np.ndarray) -> tuple[np.ndarray, float]:
+    """Ledoit-Wolf (2004) shrinkage towards a scaled identity; X is (samples, features)."""
+    X = np.asarray(X, dtype=float)
+    n, p = X.shape
+    if p == 0:
+        return np.empty((0, 0)), 0.0
+    Xc = X - X.mean(axis=0, keepdims=True)
+    S = Xc.T @ Xc / max(n, 1)
+    mu = float(np.trace(S) / p)
+    delta = float(np.sum((S - mu * np.eye(p)) ** 2) / p)
+    if n <= 1 or delta <= 1e-12:
+        return mu * np.eye(p) if mu > 0 else np.eye(p), 1.0
+    beta = 0.0
+    for row in Xc:
+        outer = np.outer(row, row)
+        beta += float(np.sum((outer - S) ** 2))
+    beta = min(beta / (n * n) / p, delta)
+    shrink = beta / delta
+    cov = shrink * mu * np.eye(p) + (1.0 - shrink) * S
+    return cov, float(shrink)
+
+
+def whitened_weights(F: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
+    """Correlation-aware weights w ∝ Σ^{-1/2} 1 (RRD_WU), with Ledoit-Wolf shrinkage.
+
+    Small probe sets make the sample covariance singular, so shrinkage is required. Negative
+    weights are clipped to zero; a degenerate matrix falls back to uniform weights.
+    """
+    F = np.asarray(F, dtype=float)
+    p = F.shape[1]
+    if p == 0:
+        return np.empty(0)
+    cov, _ = ledoit_wolf_covariance(F)
+    values, vectors = np.linalg.eigh(cov + eps * np.eye(p))
+    values = np.clip(values, eps, None)
+    inv_sqrt = vectors @ np.diag(values ** -0.5) @ vectors.T
+    weights = np.clip(inv_sqrt @ np.ones(p), 0.0, None)
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 1e-12:
+        return np.full(p, 1.0 / p)
+    return weights / total
+
+
+def contrastive_select(
+    F_core: np.ndarray,
+    F_ext: np.ndarray,
+    alignment: np.ndarray,
+    *,
+    max_L: int = 4,
+    tau_align: float = 0.05,
+    max_collinearity: float = 0.9,
+) -> dict[str, Any]:
+    """Greedy supplementary-criterion selection driven by known-direction evidence.
+
+    Candidates are ranked by directional alignment (how consistently they prefer the known
+    better probe). A candidate is skipped when its centred score profile is almost entirely
+    explained by the core and already-selected criteria (residual energy fraction below
+    ``1 - max_collinearity``). Unlike residual-variance selection this does not require the
+    probe matrix to have spare rank: a collinearity test is meaningful even for 6 rows.
+    """
+    core = np.asarray(F_core, dtype=float)
+    ext = np.asarray(F_ext, dtype=float)
+    alignment = np.asarray(alignment, dtype=float)
+    if ext.ndim != 2 or len(alignment) != ext.shape[1]:
+        raise ValueError("Invalid extension score matrix or alignment")
+    m = ext.shape[0]
+    centred_core = core - core.mean(axis=0, keepdims=True) if core.size else np.empty((m, 0))
+    centred_ext = ext - ext.mean(axis=0, keepdims=True)
+    if centred_core.shape[1]:
+        u, singular, _ = np.linalg.svd(centred_core, full_matrices=False)
+        basis = u[:, :int(np.sum(singular > 1e-8))]
+    else:
+        basis = np.empty((m, 0))
+    core_rank = int(basis.shape[1])
+    selected: list[int] = []
+    skipped_collinear: list[int] = []
+    order = sorted(range(ext.shape[1]), key=lambda p: (-alignment[p], p))
+    for p in order:
+        if len(selected) >= max_L or alignment[p] < tau_align:
+            break
+        vector = centred_ext[:, p]
+        energy = float(vector @ vector)
+        if energy > 1e-12:
+            residual = vector - basis @ (basis.T @ vector) if basis.shape[1] else vector
+            fraction = float(residual @ residual) / energy
+            if fraction < 1.0 - max_collinearity:
+                skipped_collinear.append(p)
+                continue
+            if float(np.linalg.norm(residual)) > 1e-8:
+                basis = np.column_stack([basis, residual / np.linalg.norm(residual)])
+        selected.append(p)
+    return {"selected": selected, "alignment": [float(alignment[p]) for p in selected],
+            "sigmas": [max(float(alignment[p]), 1e-6) for p in selected],
+            "skipped_collinear": skipped_collinear, "core_rank": core_rank, "final_rank": int(basis.shape[1])}
+
+
+def hierarchical_aggregate(
+    F_core: np.ndarray,
+    F_ext: np.ndarray,
+    core_weights: np.ndarray,
+    ext_weights: np.ndarray,
+    *,
+    mode: str = "lexicographic",
+    c: float = 0.8,
+    eta: float = 0.5,
+    gamma: float = 2.0,
+) -> dict[str, np.ndarray]:
+    """Combine core and supplementary scores.
+
+    ``lexicographic`` (PAOR band generalised to weighted cores): U = S_core + c·min_k(w_k)/2·S_ext.
+    With 0/1/2 criterion scores the smallest possible core gap is min_k(w_k)/2 (half a point on
+    the least-weighted core criterion); since c < 1 and S_ext ∈ [0, 1], the supplementary term can
+    never overturn a strict core ordering. With uniform weights this is PAOR's c/(2K).
+    ``gated``: MCCR v1 formula; ``linear``: (S_core + η S_ext) / (1 + η).
+    """
+    core = np.asarray(F_core, dtype=float)
+    ext = np.asarray(F_ext, dtype=float)
+    core_weights = np.asarray(core_weights, dtype=float)
+    ext_weights = np.asarray(ext_weights, dtype=float)
+    if core.ndim != 2 or core.shape[1] == 0 or core.shape[1] != len(core_weights):
+        raise ValueError("A non-empty core with matching weights is required")
+    core_weights = core_weights / core_weights.sum()
+    s_core = core @ core_weights
+    if ext.shape[1]:
+        ext_weights = ext_weights / max(float(ext_weights.sum()), 1e-12)
+        s_ext = ext @ ext_weights
+    else:
+        s_ext = np.zeros(core.shape[0])
+    if mode == "lexicographic":
+        utility = s_core + c * float(core_weights.min()) / 2.0 * s_ext
+    elif mode == "gated":
+        utility = s_core + eta * np.power(s_core, gamma) * s_ext
+    elif mode == "linear":
+        utility = (s_core + eta * s_ext) / (1.0 + eta)
+    else:
+        raise ValueError(f"Unknown aggregation mode {mode}")
+    return {"U": utility, "S_core": s_core, "S_ext": s_ext, "core_weights": core_weights, "ext_weights": ext_weights}

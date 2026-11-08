@@ -15,7 +15,7 @@ from paor_pipeline import load_json, parse_winner, save_json, truncate_text
 from paor_prompts import (DIRECT_PAIR_SYSTEM, DIRECT_PAIR_USER, DIRECT_POINT_SYSTEM,
                           DIRECT_POINT_USER, DYNAMIC_PAIR_SYSTEM, DYNAMIC_PAIR_USER,
                           DYNAMIC_POINT_SYSTEM, DYNAMIC_POINT_USER, DYNAMIC_RUBRIC_SYSTEM,
-                          DYNAMIC_RUBRIC_USER)
+                          DYNAMIC_RUBRIC_USER, DIRECT_POINT10_SYSTEM, SPCT_SYSTEM, SPCT_USER)
 
 ORIGINAL_SRC = Path(__file__).resolve().parents[1] / "generating_dynamic_rubric" / "src"
 if str(ORIGINAL_SRC) not in sys.path:
@@ -41,17 +41,33 @@ BASELINE_DESCRIPTIONS = {
     "rewardbench": "prompt-response pairs spanning general chat, adversarial instruction following, safety and appropriate refusals, mathematics, and code",
     "judgebench_gpt": "challenging objective general knowledge, reasoning, mathematics, and coding responses",
     "judgebench_claude": "challenging objective general knowledge, reasoning, mathematics, and coding responses",
+    "rubricbench": "challenging chat, instruction-following, STEM, code, and safety responses where surface sophistication can mask failures of core requirements",
+    "llmbar": "instruction-following responses, including adversarial outputs that look polished but deviate from the instruction",
+    "rmbench": "chat, code, math, and safety responses that differ in subtle correctness errors and in style or length",
+    "ppe": "real Chatbot Arena conversations judged by human preference across many domains and languages",
 }
 
 
-def parse_point_score(text: str) -> float | None:
+def parse_point_score(text: str, upper: int = 5) -> float | None:
     match = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', text)
     if not match:
-        match = re.search(r"\b([1-5](?:\.\d+)?)\b", text)
+        pattern = r"\b([1-5](?:\.\d+)?)\b" if upper == 5 else r"\b(10|[1-9](?:\.\d+)?)\b"
+        match = re.search(pattern, text)
     if not match:
         return None
     value = float(match.group(1))
-    return value if 1 <= value <= 5 else None
+    return value if 1 <= value <= upper else None
+
+
+def parse_boxed_pair(text: str) -> tuple[float, float] | None:
+    """Parse the last ``\\boxed{s1, s2}`` (SPCT output format); scores must lie in [1, 10]."""
+    matches = re.findall(r"\\boxed\{\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\}", text)
+    if not matches:
+        return None
+    first, second = (float(x) for x in matches[-1])
+    if not (1 <= first <= 10 and 1 <= second <= 10):
+        return None
+    return first, second
 
 
 def tie_prediction(pair_id: str, seed: int) -> str:
@@ -202,6 +218,85 @@ class BaselineRunner:
                                       pair_predictions=predictions, pair_details=details)
             self._finish_cost(result, method, seed)
             output.append(result)
+        return output
+
+    async def _direct_point(self, benchmark: str, groups: list[dict[str, Any]], seed: int) -> list[dict[str, Any]]:
+        """Pointwise 1-10 direct scoring of each response, compared per pair.
+
+        Isolates the effect of rubrics from the effect of switching pairwise judging to
+        independent pointwise scoring (MCCR and all rubric methods score responses independently).
+        """
+        requests, metadata = [], []
+        for group in groups:
+            for response in group["responses"]:
+                user = DIRECT_POINT_USER.format(query=self._query(group), response=self._response(response["text"]))
+                requests.append(self._request(DIRECT_POINT10_SYSTEM, user, self._tag("direct_point", seed, group["qid"]),
+                                              max_tokens=256, seed=seed))
+                metadata.append((group["qid"], response["id"]))
+        raw = await self.pool.complete_many(requests) if requests else []
+        values = {key: parse_point_score(result.text, upper=10) for key, result in zip(metadata, raw)}
+        texts = {key: result.text for key, result in zip(metadata, raw)}
+        output = []
+        for group in groups:
+            scores = {r["id"]: values.get((group["qid"], r["id"])) for r in group["responses"]}
+            result = self._result(group, scores, method="direct_point", seed=seed,
+                                  diagnostics={"raw": {r["id"]: texts.get((group["qid"], r["id"])) for r in group["responses"]}})
+            output.append(result)
+        return output
+
+    async def _sc_principles(self, benchmark: str, groups: list[dict[str, Any]], seed: int, k: int) -> list[dict[str, Any]]:
+        """SPCT-style generative judging (DeepSeek-GRM prompt format, arXiv:2504.02495) with voting@k.
+
+        Each sample writes query-specific principles, critiques both responses and emits two
+        1-10 scores; the order alternates across samples to cancel position bias, and scores are
+        summed over the k samples (the paper's voting rule, without the trained meta RM).
+        """
+        requests, metadata = [], []
+        for group in groups:
+            response_map = {x["id"]: x["text"] for x in group["responses"]}
+            for pair in group["pairs"]:
+                for sample in range(k):
+                    reverse = sample % 2 == 1
+                    a = response_map[pair["b"] if reverse else pair["a"]]
+                    b = response_map[pair["a"] if reverse else pair["b"]]
+                    user = SPCT_USER.format(query=self._query(group), response_a=self._response(a), response_b=self._response(b))
+                    requests.append(self._request(SPCT_SYSTEM, user, self._tag("sc_principles", seed, group["qid"]),
+                                                  temperature=0.7 if k > 1 else 0.0, max_tokens=1024,
+                                                  seed=seed * 1000 + sample))
+                    metadata.append((group["qid"], pair["id"], reverse))
+        raw = await self.pool.complete_many(requests) if requests else []
+        totals: dict[str, list[float]] = {}
+        parsed: dict[str, int] = {}
+        for (qid, pair_id, reverse), result in zip(metadata, raw):
+            pair_scores = parse_boxed_pair(result.text)
+            if pair_scores is None:
+                continue
+            first, second = pair_scores
+            a_score, b_score = (second, first) if reverse else (first, second)
+            total = totals.setdefault(pair_id, [0.0, 0.0])
+            total[0] += a_score
+            total[1] += b_score
+            parsed[pair_id] = parsed.get(pair_id, 0) + 1
+        output = []
+        for group in groups:
+            predictions, details = {}, {}
+            for pair in group["pairs"]:
+                total = totals.get(pair["id"])
+                detail = {"n_parsed_samples": parsed.get(pair["id"], 0), "k": k, "score_totals": total}
+                if not total:
+                    prediction = None
+                    detail["parse_error"] = True
+                elif total[0] > total[1]:
+                    prediction = "A"
+                elif total[1] > total[0]:
+                    prediction = "B"
+                else:
+                    prediction = tie_prediction(pair["id"], seed)
+                    detail["model_score_tie"] = True
+                predictions[pair["id"]] = prediction
+                details[pair["id"]] = detail
+            output.append(self._result(group, {}, method="sc_principles", seed=seed,
+                                       pair_predictions=predictions, pair_details=details))
         return output
 
     async def _dynamic(self, benchmark: str, groups: list[dict[str, Any]], seed: int) -> list[dict[str, Any]]:
@@ -476,7 +571,7 @@ class BaselineRunner:
         return output
 
     async def run(self, method: str, benchmark: str, groups: list[dict[str, Any]], *, seed: int = 0,
-                  direct_k: int | None = None, direct_budget: int = 14) -> list[dict[str, Any]]:
+                  direct_k: int | None = None, direct_budget: int = 14, sc_k: int = 8) -> list[dict[str, Any]]:
         self.benchmark = benchmark
         started = time.perf_counter()
         if method == "direct":
@@ -491,6 +586,10 @@ class BaselineRunner:
                         budgets[group["qid"]] = max(1, round((direct_budget + len(group["responses"])) / max(1, len(group["responses"]))))
                 direct_k = budgets
             output = await self._direct(benchmark, groups, seed, repeats=direct_k, method="direct_k")
+        elif method == "direct_point":
+            output = await self._direct_point(benchmark, groups, seed)
+        elif method == "sc_principles":
+            output = await self._sc_principles(benchmark, groups, seed, sc_k)
         elif method == "dynamic":
             output = await self._dynamic(benchmark, groups, seed)
         elif method == "checkeval":

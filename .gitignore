@@ -15,3 +15,6 @@ generating_dynamic_rubric/outputs/
 *.download
 generating_dynamic_rubric/data/healthbench/2025-05-07-06-14-12_oss_meta_eval.jsonl
 generating_dynamic_rubric/data/healthbench/2025-05-07-06-14-12_oss_eval.jsonl
+
+# PPE raw data: fetched by scripts/download_ppe.py (contains a string flagged by secret scanning)
+generating_dynamic_rubric/data/ppe/*.parquet

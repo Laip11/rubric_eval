@@ -37,11 +37,12 @@ def build_variant_cache(base: dict[str, Any], *, tau_core: float, tau_var: float
     cache = copy.deepcopy(base)
     for key in ("target_scores", "cost_checkpoint", "_cost_offset"):
         cache.pop(key, None)
-    criteria = cache["R_core"] + cache["R_ext_candidates"]
-    core_scores = np.asarray(cache["F_core"], dtype=float).reshape(N, -1)
-    ext_scores = np.asarray(cache["F_ext"], dtype=float).reshape(N, -1)
+    criteria = cache.get("R_core_initial", cache["R_core"]) + cache["R_ext_candidates"]  # F_core columns follow R_core_initial
+    rows = len(cache["F_core"])  # valid probes (+ counterfactuals); may be < N when probes were dropped
+    core_scores = np.asarray(cache["F_core"], dtype=float).reshape(rows, -1)
+    ext_scores = np.asarray(cache["F_ext"], dtype=float).reshape(rows, -1)
     scores = np.concatenate([core_scores, ext_scores], axis=1)
-    if scores.shape != (N, len(criteria)):
+    if scores.shape != (rows, len(criteria)):
         raise ValueError(f"Shared probe score shape {scores.shape} does not match {len(criteria)} criteria")
     core_indices = [i for i, item in enumerate(criteria) if item["rho"] >= tau_core]
     core_fallback = False
@@ -60,6 +61,9 @@ def build_variant_cache(base: dict[str, Any], *, tau_core: float, tau_var: float
     selection = orthogonal_residual_select(new_core_scores, new_candidate_scores, supports,
                                            max_L=L, tau_var=tau_var, rho_min=rho_min)
     cache["R_core"] = [criteria[i] for i in core_indices]
+    cache["R_core_initial"] = cache["R_core"]
+    cache["core_weights"] = (np.asarray([criteria[i]["rho"] for i in core_indices]) /
+                             max(sum(criteria[i]["rho"] for i in core_indices), 1e-12)).tolist()
     cache["R_ext_candidates"] = [criteria[i] for i in candidate_indices]
     cache["R_ext"] = [cache["R_ext_candidates"][i] for i in selection["selected"]]
     cache["core_fallback"] = core_fallback

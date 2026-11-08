@@ -121,6 +121,9 @@ class AsyncLLMPool:
                     self.stats[tag]["prompt_tokens"] += int(usage.get("prompt_tokens", 0))
                     self.stats[tag]["completion_tokens"] += int(usage.get("completion_tokens", 0))
                     self.stats[tag]["seconds"] += elapsed
+                    used = int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0))
+                    self.stats[tag][f"tokens:{role}"] = self.stats[tag].get(f"tokens:{role}", 0) + used
+                    self.stats[tag][f"calls:{role}"] = self.stats[tag].get(f"calls:{role}", 0) + 1
                     return LLMResult(str(content), entries, int(usage.get("prompt_tokens", 0)),
                                      int(usage.get("completion_tokens", 0)), elapsed, endpoint,
                                      finish_reason=choice.get("finish_reason"))

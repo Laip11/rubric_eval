@@ -131,3 +131,28 @@
 
 ---
 
+
+---
+
+## 实施状态（2026-11-08）
+
+下表对照本报告的各项建议，列出已在代码中落实的内容。目前**尚无真实模型结果**，所有方法优劣结论都必须在按 `EXPERIMENT_SETUP.md` 实际运行后再下。
+
+| 报告项 | 实施内容 | 位置 |
+|---|---|---|
+| P1 打分分辨率不对等 | `--score-mode discrete` 为默认值，所有准则方法统一使用离散分数；logprob 只能在所有方法都使用时开启 | `paor_pipeline.PAORPipeline._score_values` |
+| P1 解析失败被静默中和 | `--missing-policy fail` 为默认值：目标回答有准则缺失时直接计 parse error，不再按 0.5 处理 | `_resolve_missing`, `decide_pair` |
+| P1 强模型探测相当于参考答案 | 新增 `direct_ref`（以探测作参考答案）；主设置改为 G = J；共享探测 | `rubric_baselines.py`, `ProbeStore` |
+| P1 判定协议与算力不对等 | 所有分数型方法共用同一个 fallback；记录按角色拆分的 token 和参数加权 token；新增 strict / lenient 两种口径；提供准确率–算力曲线的运行命令 | `metrics.py`, `EXPERIMENT_SETUP.md` §7 |
+| P2 残差选择空转 | 诊断脚本输出 L′ 分布和秩饱和比例；v2 改为方向对齐选择，配合共线性检验 | `mccr_diagnostics.py`, `mccr_core.contrastive_select` |
+| P2 方差 ≠ 判别力 | 用强 ≻ 弱、原始 ≻ 反事实两类有序对计算方向对齐度，并用它过滤错向准则（包括 core 中的准则） | `mccr_core.directional_alignment`, `MCCRPipeline._counterfactuals` |
+| P3 core ≈ 先验视图 | 诊断项 `core_share_prior_echoed_once`；`new_our_method.md` 删除了"严格最小 / 无冗余"的说法 | `mccr_diagnostics.py`, `new_our_method.md` |
+| P4 fallback 可能主导结果 | 新增 `fallback_accuracy` 和 `non_fallback_accuracy` 两项指标 | `metrics.py` |
+| P5 工程补丁过多 | 默认改为 `--probe-recovery simple`（同一模型、一次简洁提示重试、丢弃用尽重试的槽位）；v2 去掉了 4 个超参数 | `paor_pipeline._generate_probes` |
+| 1.3 白化加权与词典序聚合 | Ledoit–Wolf 白化；带可证明保证的词典序聚合 | `mccr_core.whitened_weights`, `hierarchical_aggregate` |
+| §2 数据集 | 新增 RubricBench、LLMBar、RM-Bench、PPE 的 loader（JudgeBench 已有）；新增 `--split all`；RB2 best-of-4、RM-Bench 风格矩阵、分子集指标 | `paor_data.py`, `metrics.py` |
+| §3 Baseline | 新增 RRD（WU / 均匀权重）、CRG、RTD、rubric_query / rubric_resp、SPCT@k、direct_point、direct_ref、expert_rubric；RubricHub 标注为 lite 版 | `rubric_baselines.py`, `baselines.py`, `docs/BASELINES.md` |
+| §4 统计 | 主方法对全部其他方法做 McNemar 检验和配对 bootstrap，并做 Holm 校正；3 个 seed 的运行命令 | `run_main.significance_against_all` |
+| H1 准则覆盖 | 计算 RubricBench 专家准则的召回率、精确率和冗余率 | `rubric_recall.py` |
+
+**尚未实现：** RLCF、MRRG、TICK、RocketEval、Prometheus 2 的接入；训练型参考行（Rubric-RM、DeepSeek-GRM）；准则级 pairwise 平局处理（建议 1.3 第 4 条中的第一步）；Best-of-N / GRPO 下游实验。

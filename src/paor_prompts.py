@@ -39,6 +39,24 @@ Rules:
 Output ONLY valid JSON:
 {{"response_rubrics": [{{"id": "R1", "criterion": "<one checkable requirement>"}}]}}'''
 
+PROMPT_COUNTERFACTUAL = '''Below are a user query and a response to it. Rewrite the response so that it becomes
+CLEARLY WORSE for this query because of exactly ONE substantive flaw, while keeping its length,
+tone, structure and formatting as close to the original as possible.
+
+Choose the single most consequential flaw for this query, for example:
+- violate one explicit requirement or constraint of the query;
+- introduce one factual, computational or logical error that changes the conclusion;
+- omit one essential part of what was asked;
+- for a request that should be refused, comply; for a benign request, refuse.
+
+Do not mention, mark, or hint at the flaw. Output ONLY the rewritten response.
+
+### User Query:
+{query}
+
+### Original Response:
+{response}'''
+
 PROMPT_POSTERIOR_EXPANSION = '''You are an expert meta-evaluator. Below are a user query, the Core Criteria (already
 covering the basic requirements), and several Sample Responses of varying quality.
 
@@ -124,3 +142,99 @@ DESCRIPTIONS = {
     "helpsteer2": "helpful, correct, coherent AI assistant responses",
     "healthbench": "medically accurate, safe, and appropriately scoped health responses",
 }
+
+# ---------------------------------------------------------------------------
+# Prompts for the probe-based rubric baselines (see src/rubric_baselines.py).
+# ---------------------------------------------------------------------------
+
+PROMPT_QUERY_RUBRIC = '''You are an expert evaluation architect. Given a user query, write a rubric of atomic,
+independently checkable criteria for judging responses to it. Cover explicit constraints, essential
+implicit requirements, and the qualities that separate excellent from mediocre answers.
+Use 3 to 10 criteria; phrase each positively so that satisfying it means a better response.
+
+### User Query:
+{query}
+
+Output ONLY valid JSON:
+{{"rubrics": [{{"id": "C1", "criterion": "<one checkable requirement>"}}]}}'''
+
+PROMPT_RESP_RUBRIC = '''You are an expert evaluation architect. Given a user query and several sample responses,
+write a rubric of atomic, independently checkable criteria for judging responses to this query.
+Use the samples to reveal requirements, typical failure modes and distinguishing qualities, but phrase
+criteria about the task, never about a specific sample. Do not reward length or formatting unless required.
+Use 3 to 10 criteria; phrase each positively.
+
+### User Query:
+{query}
+
+### Sample Responses:
+{probes}
+
+Output ONLY valid JSON:
+{{"rubrics": [{{"id": "C1", "criterion": "<one checkable requirement>"}}]}}'''
+
+PROMPT_RRD_DECOMPOSE = '''The rubric criterion below is satisfied by almost all sample responses, so it does not
+discriminate between them. Decompose it into 2 to 4 finer-grained, more demanding atomic criteria that
+together refine its intent and would separate excellent responses from merely adequate ones.
+Each new criterion must be checkable, positively phrased, and must not duplicate the others.
+
+### User Query:
+{query}
+
+### Criterion to decompose:
+{criterion}
+
+### Sample Responses:
+{probes}
+
+Output ONLY valid JSON:
+{{"rubrics": [{{"id": "D1", "criterion": "<finer checkable requirement>"}}]}}'''
+
+PROMPT_CRG = '''You are an expert evaluation architect. Contrast the Preferred and the Rejected response to the
+user query and derive a rubric with two parts:
+- "hard_rules": explicit, non-negotiable constraints of the query that any acceptable response must satisfy
+  (1 to 5 items);
+- "principles": implicit quality principles that distinguish better from worse responses (2 to 6 items).
+Phrase every item about the task, never about a specific response, and phrase it positively.
+
+### User Query:
+{query}
+
+### Preferred Response:
+{chosen}
+
+### Rejected Response:
+{rejected}
+
+Output ONLY valid JSON:
+{{"hard_rules": [{{"id": "H1", "criterion": "..."}}], "principles": [{{"id": "Q1", "criterion": "..."}}]}}'''
+
+PROMPT_RTD_REFINE = '''You are refining an evaluation rubric. The two responses below are currently the
+highest-scoring responses under the rubric. Identify what genuinely distinguishes the better of the two
+(correctness of details, depth, adherence to the query) and encode these distinctions as new criteria or as
+sharper versions of existing criteria. Return the COMPLETE updated rubric (3 to 12 criteria), keeping useful
+existing criteria. Phrase criteria about the task, never about a specific response.
+
+### User Query:
+{query}
+
+### Current Rubric:
+{rubric}
+
+### Response 1:
+{response_1}
+
+### Response 2:
+{response_2}
+
+Output ONLY valid JSON:
+{{"rubrics": [{{"id": "C1", "criterion": "<one checkable requirement>"}}]}}'''
+
+DIRECT_REF_PAIR_SYSTEM = '''You are an objective judge of AI assistant responses. A reference answer written by a strong model is provided; it may itself contain mistakes, so use it as guidance, not as ground truth. Compare Response A and Response B for the given instruction. Do not reward length or formatting by themselves. Output ONLY valid JSON: {"winner":"A" or "B","reason":"brief reason"}.'''
+DIRECT_REF_PAIR_USER = '''[Instruction]\n{query}\n\n[Reference Answer]\n{reference}\n\n[Response A]\n{response_a}\n\n[Response B]\n{response_b}\n\nWhich response is better? Output only JSON.'''
+
+DIRECT_POINT10_SYSTEM = '''You are an objective evaluator. Score the response from 1 to 10 for how well it fulfils the user's request: correctness, instruction following, helpfulness and safety. Do not reward verbosity by itself. Output ONLY valid JSON: {"score": integer from 1 to 10, "reason":"brief reason"}.'''
+
+SPCT_SYSTEM = '''You are a skilled evaluator of AI assistant responses. First write the evaluation principles that matter most for this specific query (with weights), then critique each response against those principles, and finally give each response an integer score from 1 to 10. End your answer with exactly one line of the form:
+Scores: \\boxed{s1, s2}'''
+SPCT_USER = '''[Query]\n{query}\n\n[Response 1]\n{response_a}\n\n[Response 2]\n{response_b}'''

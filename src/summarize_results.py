@@ -46,7 +46,7 @@ def collect(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     for benchmark_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         benchmark = benchmark_dir.name
         comparisons = {path.name: load(path) for path in sorted(benchmark_dir.glob("*_vs_*.json"))}
-        primary_significance = (comparisons.get("mccr_vs_strongest.json") or
+        primary_significance = (comparisons.get("mccr_v2_vs_strongest.json") or comparisons.get("mccr_vs_strongest.json") or
                                 comparisons.get("paor_vs_strongest.json") or {})
         benchmark_result = {"methods": {}, "significance": primary_significance, "comparisons": comparisons}
         for method_dir in sorted(p for p in benchmark_dir.iterdir() if p.is_dir()):
@@ -68,8 +68,11 @@ def collect(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             summary = aggregate_seed_metrics(seed_metrics)
             benchmark_result["methods"][method_dir.name] = summary
             row = {"benchmark": benchmark, "method": method_dir.name}
-            cost_keys = {"avg_calls_per_sample", "avg_input_tokens_per_sample", "avg_output_tokens_per_sample", "wall_seconds"}
-            for key in ["kind", "n_queries", "n_samples", "accuracy", "accuracy_std", "fallback_rate", "pearson", "pearson_std",
+            cost_keys = {"avg_calls_per_sample", "avg_input_tokens_per_sample", "avg_output_tokens_per_sample", "wall_seconds",
+                         "param_tokens_per_sample"}
+            for key in ["kind", "n_queries", "n_samples", "accuracy", "accuracy_std", "accuracy_lenient", "accuracy_lenient_std",
+                        "query_all_correct", "query_all_correct_std", "position_consistency", "fallback_accuracy",
+                        "accuracy_subset_macro", "param_tokens_per_sample", "fallback_rate", "pearson", "pearson_std",
                         "spearman", "spearman_std", "kendall", "kendall_std", "within_query_kendall", "within_query_kendall_std",
                         "system_spearman", "system_spearman_std", "avg_calls_per_sample", "avg_input_tokens_per_sample",
                         "avg_output_tokens_per_sample", "wall_seconds", "n_parse_errors"]:
@@ -147,9 +150,24 @@ def markdown(report: dict[str, Any], rows: list[dict[str, Any]], manifest: dict[
         kind = next(iter(methods.values())).get("kind", "pairwise")
         lines += ["", f"## {benchmark}", ""]
         if kind == "pairwise":
-            lines += ["| 方法 | Accuracy | 95% CI（seed0） | Fallback | 顺序不一致 | 模型同分 | 解析失败 | 平均调用/样本 | 平均输入 token/样本 | 平均输出 token/样本 |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+            lines += ["| 方法 | Accuracy (strict) | 95% CI（seed0） | Accuracy (tie=0.5) | Query 全对 (best-of-N) | 位置一致率 | Fallback | Fallback 子集 Acc | 顺序不一致 | 模型同分 | 解析失败 | 平均调用/样本 | 平均输入 token/样本 | 平均输出 token/样本 | 参数加权 token/样本 (B·tok) |",
+                      "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for method, summary in methods.items():
-                lines.append(f"| {method} | {mean_std(summary, 'accuracy')} | {confidence_interval(summary, 'accuracy')} | {summary.get('fallback_rate', 0):.4f} | {summary.get('n_order_disagreements', 0):.0f} | {summary.get('n_model_score_ties', 0):.0f} | {summary.get('n_parse_errors', 0):.2f} | {cold_cost(summary, 'avg_calls_per_sample'):.2f} | {cold_cost(summary, 'avg_input_tokens_per_sample'):.1f} | {cold_cost(summary, 'avg_output_tokens_per_sample'):.1f} |")
+                param_tokens = cold_cost(summary, 'param_tokens_per_sample')
+                lines.append(f"| {method} | {mean_std(summary, 'accuracy')} | {confidence_interval(summary, 'accuracy')} | {mean_std(summary, 'accuracy_lenient')} | {mean_std(summary, 'query_all_correct')} | {mean_std(summary, 'position_consistency')} | {summary.get('fallback_rate', 0):.4f} | {mean_std(summary, 'fallback_accuracy')} | {summary.get('n_order_disagreements', 0):.0f} | {summary.get('n_model_score_ties', 0):.0f} | {summary.get('n_parse_errors', 0):.2f} | {cold_cost(summary, 'avg_calls_per_sample'):.2f} | {cold_cost(summary, 'avg_input_tokens_per_sample'):.1f} | {cold_cost(summary, 'avg_output_tokens_per_sample'):.1f} | {param_tokens:.0f} |")
+            subset_methods = {m: (x.get("per_seed") or [{}])[0].get("accuracy_by_subset") for m, x in methods.items()}
+            subset_methods = {m: v for m, v in subset_methods.items() if v}
+            if subset_methods:
+                subsets = sorted({k for v in subset_methods.values() for k in v})
+                lines += ["", "分子集 Accuracy（seed0）：", "", "| 方法 | " + " | ".join(subsets) + " |", "|---|" + "---:|" * len(subsets)]
+                for m, v in subset_methods.items():
+                    lines.append(f"| {m} | " + " | ".join(f"{v[k]:.4f}" if k in v else "—" for k in subsets) + " |")
+            rm_methods = {m: (x.get("per_seed") or [{}])[0].get("rmbench") for m, x in methods.items()}
+            rm_methods = {m: v for m, v in rm_methods.items() if v}
+            if rm_methods:
+                lines += ["", "RM-Bench 官方口径（按领域平均）：", "", "| 方法 | Hard | Normal | Easy | Total |", "|---|---:|---:|---:|---:|"]
+                for m, v in rm_methods.items():
+                    lines.append(f"| {m} | " + " | ".join(f"{v[k]:.4f}" if v.get(k) is not None else "—" for k in ["hard", "normal", "easy", "total"]) + " |")
         else:
             lines += ["| 方法 | Pearson | Spearman | 95% CI（seed0） | Kendall | 组内 Kendall | 系统 Spearman | 解析失败 | 平均调用/样本 | 平均输出 token/样本 |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for method, summary in methods.items():
@@ -158,6 +176,16 @@ def markdown(report: dict[str, Any], rows: list[dict[str, Any]], manifest: dict[
         if significance:
             method_name = significance.get("method", "paor").upper()
             lines += ["", f"{method_name} 对最强 baseline `{significance.get('baseline', 'unknown')}` 的显著性检验：`{json.dumps(significance.get('significance', {}), ensure_ascii=False)}`。"]
+        for name, value in result.get("comparisons", {}).items():
+            if name.endswith("_vs_all.json") and value:
+                lines += ["", f"`{value.get('method')}` 对全部方法的配对检验（McNemar，Holm 校正；配对 query-bootstrap 差值）：", "",
+                          "| 对照 | 方法对/对照错 | 对照对/方法错 | p | p (Holm) | Δacc | 95% CI |", "|---|---:|---:|---:|---:|---:|---:|"]
+                for baseline, test in value.get("comparisons", {}).items():
+                    boot = test.get("paired_bootstrap", {})
+                    ci = boot.get("ci95", [None, None])
+                    lines.append(f"| {baseline} | {test.get('method_correct_baseline_wrong', '—')} | {test.get('baseline_correct_method_wrong', '—')} | "
+                                 f"{test.get('p_value', float('nan')):.4g} | {test.get('p_value_holm', float('nan')):.4g} | "
+                                 f"{boot.get('difference', float('nan')):+.4f} | [{ci[0] if ci[0] is None else round(ci[0], 4)}, {ci[1] if ci[1] is None else round(ci[1], 4)}] |")
         comparison = result.get("comparisons", {}).get("mccr_vs_paor.json")
         if comparison:
             lines += ["", f"MCCR 对旧 PAOR 的显著性检验：`{json.dumps(comparison.get('significance', {}), ensure_ascii=False)}`。"]

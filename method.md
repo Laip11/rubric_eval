@@ -1,163 +1,87 @@
 # MCCR-Eval 当前方法与实验协议
 
-更新时间：2026-11-07
+更新时间：2026-11-08
 
-本文档是当前执行口径。完整数学定义见 `new_our_method.md`；运行命令见 `EXPERIMENT_SETUP.md`。此前的 PAOR、AlpacaEval/MT-Bench/BiGGen 主表及 Pointwise 计划均属于历史方案，不与本轮结果混算。
+本文档是当前的执行口径。数学定义见 `new_our_method.md`（第 4 节为 MCCR v2），审查结论和改动理由见 `docs/MCCR_REVIEW.md`，baseline 的实现细节和与原论文的偏差见 `docs/BASELINES.md`，运行命令见 `EXPERIMENT_SETUP.md`。
 
-## 1. 研究目标与对照关系
+**与 2026-11-07 口径相比的变更：** ① 默认使用离散分数，解析失败直接计错；② 所有依赖探测的方法共享同一组探测；③ 新增 MCCR v2 以及 RRD 等 9 个对照方法；④ 新增 JudgeBench、PPE、RubricBench、LLMBar、RM-Bench；⑤ 新增官方口径指标、FLOPs 代理指标和 Holm 校正。旧缓存的签名已失效（`mccr-v7-fair-protocol`），不会被误用。
 
-本轮主方法是 **MCCR-Eval（Multi-view Consensus Clustering and Residual Orthogonal Filtering）**，旧 PAOR 只作为同协议对照。
+## 1. 方法角色
 
-原论文 *Generating and Refining Dynamic Evaluation Rubrics for LLM-as-a-Judge* 及其仓库仅用于提供 CheckEval、DnA-Eval、RubricHub 的算法组件。本轮不声称复现该论文的主结果，也不把其 dynamic/DPO 方法与 MCCR 混为一谈。
+| 方法 | 角色 | 是否使用探测 |
+|---|---|---|
+| `mccr_v2` | **主方法**：多视图共识 + 方向性弱监督筛选 + 白化权重 + 词典序聚合 | 是（另加反事实降级探测） |
+| `mccr` | MCCR v1 原始规范（残差方差选择 + 门控），作为自身前身对照 | 是 |
+| `paor` | 更早的前身（先验基 + 后验扩展 + 缺陷带） | 是 |
+| `direct` | 正反两序直接 pairwise 裁判 | 否 |
+| `direct_point` | 逐回答 1–10 直接打分再比较：把“pointwise 打分方式”与“准则本身”的作用分开 | 否 |
+| `direct_k` / `direct_k<k>` | 采样多数投票；显式 `--direct-k` 用于画算力曲线 | 否 |
+| `direct_ref` | **参考答案引导**的 direct（参考答案 = 第一个强生成器探测）：检验“探测其实充当了参考答案”这一解释 | 是 |
+| `sc_principles_k<k>` | SPCT 式“原则 + 批评 + 打分”，正反交替投票 @k | 否 |
+| `rubric_query` | 单次调用、只看 query 生成准则（RRD 表中的 “LLM Rubrics w/o resp.”） | 否 |
+| `rubric_resp` | 单次调用、看 query + 全部探测生成准则（“LLM Rubrics w. resp.”） | 是 |
+| `rrd` / `rrd_uniform` | RRD（arXiv:2602.05125）：递归分解、错向/冗余过滤、WU 白化或均匀权重 | 是 |
+| `crg` | OpenRubrics 的对比式准则生成（prompt 版，用强/弱探测构成伪偏好对） | 是 |
+| `rtd` | Chasing the Tail 的 Refinement-through-Differentiation | 是 |
+| `expert_rubric` | **Oracle 上界**：RubricBench 专家准则 + 同一裁判 | 否 |
+| `checkeval` / `dna` / `rubrichub` | 原仓库算法组件（`rubrichub` 实为 RubricHub-lite，见 `docs/BASELINES.md`） | 否 |
 
-当前方法角色：
+## 2. 公平性协议（所有方法一致）
 
-| 方法 | 作用 |
-|---|---|
-| `mccr` | 新主方法 |
-| `paor` | 旧方法对照，验证 MCCR 是否真正带来改进 |
-| `direct` | 无准则直接裁判，正反两个顺序 |
-| `checkeval` | 原仓库 CheckEval prompt、parser、评分逻辑 |
-| `dna` | 原仓库 DnA aspect、weight、逐 aspect 评分与加权逻辑 |
-| `rubrichub` | 原仓库参考回答、带权准则、逐 criterion 判定与加权逻辑 |
-| `direct_k` | 近似调用数对齐的采样裁判；不视为严格 token/FLOP 对齐 |
-| `dynamic` | 可选历史参考，不进入默认主表 |
+- **共享探测。** `ProbeStore`（`src/paor_pipeline.py`）对每个 (benchmark, query, seed) 只生成一次探测。所有使用探测的方法读取同一组探测，**每个方法都计入全部探测成本**。可用 `--no-share-probes` 关闭，但不建议。
+- **分数分辨率。** `--score-mode discrete`（默认）：所有准则类方法的准则分数为 {0, 0.5, 1}，与 baseline 的离散输出可比。`logprob` 软分数只能在所有方法都使用时启用；pointwise 实验会强制检查这一点。
+- **解析失败。** `--missing-policy fail`（默认）：目标回答只要有任何一条准则未解析，该回答的分数就记为缺失，相关 pair 计为 parse error（correct=0），与 baseline 一致。旧行为（缺失按 0.5 处理）需显式指定 `neutral`。探测侧的缺失分数只影响准则筛选，仍按 0.5 处理并计入 `parse_fail`。
+- **平局。** 所有分数型准则方法（MCCR、PAOR、RRD、CRG、RTD、rubric_*、expert）对 |ΔU| ≤ 1e-4 的 pair 走同一个正反两序 direct fallback；fallback 内正反结论不一致时计错。Direct 类方法的正反不一致计错；`direct_point` 和 `sc_principles` 的同分按 `sha256(seed+pair_id)` 随机分配，并记录 `model_score_tie`。
+- **探测恢复。** `--probe-recovery simple`（默认）：每个槽位固定使用同一模型，被截断后加一句简洁提示重试，用尽 `--probe-max-attempts` 次后丢弃该槽位；完整探测少于 `--min-probes` 时显式失败。旧的 7 级恢复链（中途换模型、换裁判、强制 JSON）保留为 `full`，只用于复现旧结果。
+- **算力。** 记录每个方法每个 query 的调用数、输入/输出 tokens、墙钟时间，以及按角色拆分的 `tokens:<role>`。`--role-params strong=9 generator=27 weak=7` 给出参数加权 token（`param_tokens_per_sample`，近似 FLOPs）。主表同时报告准确率和算力，并画准确率–算力曲线（第 6 节）。
+- **信息设置。** 主设置为 **G = J**：生成与评分使用同一个模型，`--generator-model-path` 指向裁判模型。次设置为 G = 强模型，此时**所有**使用生成器的方法共用同一个 G，并且必须同时报告 `direct_ref`。
 
-## 2. 新数据集
+## 3. 数据集
 
-### 2.1 RewardBench 2（非 Ties）
+| 数据集 | loader | 规模 | 主指标 | 验证目标 |
+|---|---|---|---|---|
+| RewardBench 2（非 Ties） | `rewardbench2` | 1,763 query / 5,286 pair | **官方 best-of-4**（`query_all_correct`）+ 派生 pair acc + 分子集 | 客观正确性、精确 IF；准则是否有助于 Math/Factuality |
+| HelpSteer3-Preference val | `helpsteer3` | 2,016 → test 1,823 非 tie | pair acc（分 domain） | 真实多领域人类偏好 |
+| JudgeBench（GPT-4o 子集） | `judgebench_gpt` | 350 pair | pair acc（正反两序） | 困难正确性；可与 RRD 已报告数字对照 |
+| PPE Human Preference v1 | `ppe` | 10,211 非 tie pair | pair acc（分类别） | 大规模 Arena 偏好；可与 RRD 对照 |
+| RubricBench | `rubricbench` | 1,147 pair + 专家原子准则 | 官方分组 acc（IF/STEM/CODE/SAFE/CHAT）+ **专家准则召回率** | H1：准则覆盖；`expert_rubric` 给出上界 |
+| LLMBar | `llmbar` | 419 pair（Natural + 4 个 Adversarial 子集） | 分子集 acc | H2：表面好但违反指令 |
+| RM-Bench | `rmbench` | 1,327 prompt × 3×3 风格矩阵 = 11,941 pair | 官方 Hard/Normal/Easy（按领域平均） | H2：风格/长度偏差鲁棒性 |
 
-来源：[RewardBench 2 论文](https://arxiv.org/html/2506.01937v2)与[官方数据](https://huggingface.co/datasets/allenai/reward-bench-2)。使用 Factuality、Precise IF、Math、Safety、Focus 五个子集。
+数据来源和检查见 `generating_dynamic_rubric/data/README_DATA.md`。PPE 不在 git 中，运行前需执行 `python scripts/download_ppe.py`。注意 RubricBench 中有 510 条来自 HelpSteer3、132 条来自 RewardBench 2，与上述两个数据集可能重叠，因此它**不能**用于调参；它和 LLMBar、RM-Bench、JudgeBench、PPE 一样，用 `--split all` 冻结超参数后整体评估。
 
-- 原始 1,763 个 prompt，每个 1 个正确候选和 3 个错误候选。
-- 每个正确–错误组合构造成一个 pairwise 样本；3 个重复 rejected 文本按 query 去重，最终 5,286 个 pair。
-- Ties 子集有多个正确/错误候选及专门 margin 指标，不进入当前普通 pairwise 主表。
-- A/B 方向由 `sha1(subset + id + choice_index)` 确定性打乱，防止位置标签泄漏。
-- 固定分层划分：100 dev query；1,663 test query；4,986 test pair。
-- 指标是**派生 correct-vs-incorrect pairwise accuracy**，不是官方 best-of-4 leaderboard 分数。
+**划分规则：** 只有 RewardBench 2 和 HelpSteer3 有固定 dev（各 100 query，`cache/splits/*.json`），**全部超参数只在这两个 dev 上确定**；其余数据集不调参。
 
-### 2.2 HelpSteer3-Preference validation
+## 4. MCCR v2 流程（`mccr_v2`）
 
-来源：[HelpSteer3-Preference 论文](https://arxiv.org/html/2505.11475v1)与[官方数据](https://huggingface.co/datasets/nvidia/HelpSteer3)。只使用官方 `preference/validation.jsonl.gz`，不读取 train。
+1. 先验视图：只看 query，生成 1–5 条原子准则。
+2. 共享探测 N=6（偶数槽为强生成器、奇数槽为弱模型；温度 0.3/0.7/1.0 循环）。
+3. 每个有效探测生成一个响应视图（1–6 条准则）。
+4. 反事实：对最多 3 个强生成器探测各生成一份只含**一个**实质缺陷的降级版本。
+5. Qwen3-Embedding 余弦距离 + average linkage 聚类（θ=0.8），取 medoid，计算支持度 ρ，ρ ≥ 0.5 的进入 core。
+6. 裁判对全部有效探测和反事实在所有 medoid 上打分；用强≻弱、原始≻反事实两类有序对计算方向对齐度 $a_r$。
+7. 从 core 中移除 $a_r<-0.05$ 的错向准则；补充准则按 $a_p$ 贪心选择，带共线性检验，最多 L=4 条。
+8. core 权重用 Ledoit–Wolf 收缩白化；采用词典序聚合 $U=S_{core}+c\cdot\min_k w_k/2\cdot S_{ext}$（c=0.8）。离散分数下补充项可证明不会推翻 core 上的差距。
+9. 平局走共享 fallback。
 
-- 原始 2,017 个 validation pair；总体偏好来自 3–5 名人工标注者，过滤高分歧样本。
-- 排除 1 个两个回答文本完全相同但标签非 tie 的退化样本，保留 2,016 个 query。
-- `overall_preference < 0` 对应 response1 更好，`> 0` 对应 response2 更好，`0` 为人类 tie。
-- 保留原始 A/B 方向和 `overall_preference`；先固定划分，再在推理前过滤人类 tie，避免改变 dev/test 成员。
-- 按 domain 分层，在 validation 内固定划分 100 dev query 和 1,916 个原始 test query；test 中过滤 93 个人类 tie 后，正式评估为 1,823 query / 1,823 pair。
+v1（`mccr`）保留原规范：支持度权重、残差方差选择（只用探测行）、门控聚合，但同样运行在第 2 节的公平协议下。各组件可通过 `--mccr-selection/--mccr-core-weighting/--mccr-aggregation/--mccr-contrast/--mccr-filter-core` 单独替换，配合 `--method-suffix` 做消融。
 
-### 2.3 不再作为默认主基准的数据
+**每 query 调用预算（N=6、R 个目标回答）：** 1（先验）+ 6（探测）+ 6（响应视图）+ 3（反事实）+ 9（探测 + 反事实评分）+ R（目标评分），再加 fallback。v1 为 19+R。
 
-RewardBench、JudgeBench、AlpacaEval、MT-Bench、BiGGen 的 loader 保留用于历史或附加分析，但不进入本轮默认主表。Pointwise 仍暂停。
+## 5. 指标与统计
 
-## 3. MCCR-Eval 实现
+- **固定分母。** 人类 tie 在固定划分之后、推理之前过滤；所有方法使用完全相同的 pair ID 集合。缺失、解析失败和正反不一致都保留在分母中并计错（strict）。
+- **同时报告：** `accuracy`（strict）、`accuracy_lenient`（未解决的平局记 0.5）、`query_all_correct`（RB2 官方 best-of-4）、`accuracy_by_subset` 及其宏平均、RM-Bench Hard/Normal/Easy、`position_consistency`、`fallback_rate` 及 fallback / 非 fallback 子集准确率、调用数 / token / 参数加权 token。
+- **CI 与显著性：** query-level bootstrap（默认 1,000 次）。主方法对**每一个**其他方法做 McNemar 检验和配对 query-bootstrap 差值检验，并做 Holm 校正（`<primary>_vs_all.json`）；同时单独输出 `mccr_v2_vs_mccr`、`mccr_vs_paor`、`mccr_v2_vs_rrd`。
+- **Seed：** 正式结果至少跑 3 个 seed（`--seeds 0 1 2`），报告均值 ± 标准差。确定性方法（direct、checkeval、dna、dynamic）在非零 seed 上复用 seed0 的结果。
 
-### 3.1 完整探测
+## 6. 机制诊断与准则质量
 
-每个 query 使用 `N=6` 条探测，3 条来自生成器 `G`，3 条来自弱模型，温度按 `{0.3,0.7,1.0}` 循环。探测而不是待测回答用于准则生成和筛选，避免 target 信息泄漏。
+- `src/mccr_diagnostics.py`：L′ 分布、L′=0 的比例、core 秩是否饱和、core 中含先验成员 / 只被回声一次 / 只来自响应视图的比例、fallback 比例与 fallback 子集准确率、探测丢弃数、错向 core 准则数。用于实证检验审查报告中的 P2–P4。
+- `src/rubric_recall.py`：在 RubricBench 上计算各方法生成准则对专家准则的召回率、精确率和冗余率（嵌入匹配，或 LLM 匹配器）。
 
-每条探测最多 4,096 tokens，并记录 `finish_reason`、`completion_tokens` 和尝试次数：
+## 7. 当前边界
 
-- `finish_reason=length`、达到输出上限或空文本均视为无效；
-- 无效探测使用新 seed 重新生成，最多 7 次；第 2 次要求不超过 1,200 tokens，第 3–4 次降温到 0.2，要求不超过 3,000 tokens 直接给出最终答案，长序列用范围/省略号紧凑表示，多项请求保持显式数量但压缩每项解释；
-- 第 4 次在强生成器与弱模型之间切换；第 5 次改用裁判模型，只允许 800 tokens 内的最终回答，不确定时明确说明而非无限推导；第 6–7 次将原会话标为数据，使用 guided JSON Schema 强制 `answer/explanation/confidence` 结构，答案/解释分别最多 200/500 字符，输出硬上限 1,024 tokens，不保留推导或重复分析；实际 `probe_roles` 和 `probe_role_recoveries` 全量记录；
-- 只有完整探测才能进入后续阶段；
-- 每次失败的原始文本、finish reason 和 token 数写入 `probe_failure_records`；
-- 超过重试次数则显式终止，不把截断文本静默写入得分矩阵，断点恢复也不能绕过次数上限。
-
-### 3.2 多视图原子准则
-
-对每条 query：
-
-1. 先验视图只读取 query，生成 1–5 条必要原子准则；单一独立要求只保留 1 条，不强行拆分。
-2. 每个探测分别形成一个 response-grounded 视图，生成 1–6 条原子准则，同样允许单准则视图。
-3. 合并 `M+1=7` 个视图，为每条准则保留全局唯一 ID 和来源 view。
-
-准则 JSON 使用初始生成加最多 2 次确定性重试；最终失败会记录原始输出并显式终止。对 malformed JSON，只恢复完整闭合且具有 ID/criterion 的对象，忽略不完整尾部并记录 repair 警告，不补写准则。批处理先保存全部成功 query，再报告失败，断点续跑不会丢弃同批次已成功结果。
-
-### 3.3 聚类、支持度与核心分流
-
-使用 `Qwen3-Embedding-0.6B` 的归一化嵌入，按余弦距离和 average linkage 做凝聚层次聚类，默认 `theta_sim=0.80`。
-
-每簇选择平均簇内相似度最高的 medoid。支持度为
-
-$$
-\rho_c=\beta\,\mathbb{I}[c\cap R^{(0)}\neq\varnothing]+(1-\beta)\frac1M\sum_{m=1}^M\mathbb{I}[c\cap R^{(m)}\neq\varnothing],
-$$
-
-默认 `beta=0.4`、`tau_core=0.5`。`rho>=tau_core` 的 medoid 进入核心集，其余进入补充候选池。若没有核心簇，取支持度最高的一个簇作为数值安全回退并记录 `core_fallback=true`。
-
-聚类和 medoid 是经验去重手段，不把“严格最小覆盖”或“严格无蕴涵”当作已证明结论。
-
-### 3.4 实证残差正交筛选
-
-裁判对 6 条探测在所有核心及候选 medoid 上评分，得到 `F_core` 和 `F_ext`。列中心化后，对核心矩阵做 SVD，逐步选择正交补空间中残差方差最大的候选：
-
-$$
-p^*=\arg\max_p\max(\rho_p,\rho_{\min})\frac{\|e_p\|_2^2}{M}.
-$$
-
-默认 `L=4`、`tau_var=0.04`、`rho_min=0.2`。若最佳残差方差低于阈值则提前停止。实现同时记录核心秩、最终秩、每次入选的残差方差和标准差。
-
-由于只有 6 条探测，中心化后的有效秩至多为 5；该限制会在诊断中显式保留，不把正交选择解释为真实独立性的证明。
-
-### 3.5 核心门控聚合
-
-核心和补充准则分别按支持度、入选残差标准差归一化加权：
-
-$$
-U(y)=S_{core}(y)+\eta[S_{core}(y)]^\gamma S_{ext}(y),
-$$
-
-默认 `gamma=2.0`、`eta=0.5`。无补充准则时 `S_ext=0`，退化为 `U=S_core`。
-
-Pairwise 使用 `epsilon=1e-4` 判定带内平局；需要时使用同一裁判做正反顺序 fallback。
-
-## 4. 统一模型与长度预算
-
-| 角色 | 模型 | 上下文上限 | 用途 |
-|---|---|---:|---|
-| `G` | Qwen3.8-27B | 40,960 | 全部生成侧调用、MCCR/PAOR 强探测 |
-| `J` | Qwen3.5-9B | 32,768 | 全部最终评分、pairwise 裁判和 fallback |
-| 弱探测 | Qwen2.5-7B-Instruct | 16,384 | 仅弱探测 |
-| 嵌入 | Qwen3-Embedding-0.6B | 模型默认 | 语义聚类与 PAOR 冗余度 |
-
-长度设置依据真实新数据统计，而不是任意增大：
-
-- query 上限 8,192：HelpSteer3 最大约 4,359 tokens，保留余量；
-- 待测 response 上限 4,096：新数据最大约 2,406 tokens，无目标回答截断；
-- probe 上限 4,096：用于完整重采样，不代表希望每条都生成到上限；
-- MCCR 原子裁判输出上限 4,096：允许一次返回较多 medoid 的评分；
-- MCCR 先验/响应视图输出分别为 1,024/768 tokens；
-- baseline 使用原仓库预算：CheckEval checklist 1,024、DnA aspect/weight 512/256、逐 aspect 评分 64、RubricHub reference/rubric 1,024/2,048、逐 criterion 评分 256。
-
-Qwen3.5/Qwen3.8 均设置 `enable_thinking=false`。GPU0–5 均为通用 worker，按批次动态加载 G/J/weak；每个角色批次拆分到全部可用 GPU，角色变化时关闭旧引擎并释放显存。不同方法协程并发，同一方法内部依赖阶段保持顺序。
-
-## 5. 判定、同分和指标
-
-- **固定评估集合**：人类 gold tie 在固定划分后、推理前统一过滤，不进入 Accuracy、显著性、bootstrap 或成本；所有方法必须使用完全相同的 pair ID 集合。
-- **Pairwise accuracy**：分母固定为全部评估 pair；预测缺失、模型无法区分和解析失败均按该样本 correct=0，不使用 valid-only accuracy，也不剔除失败样本。
-- **正反顺序**：普通 direct 每对运行原始/交换两次；结论不一致时计错并记录 `n_order_disagreements`，不冒充 JSON 解析失败。`direct_k` 是额外的多次采样预算基线，不受两次限制。
-- **独立评分同分**：按 `sha256(seed + pair_id)` 做可复现随机分配，单独报告 `n_model_score_ties`，不再固定选 A。
-- **Fallback**：MCCR/PAOR 带内平局率单独报告；fallback 的正反不一致同样计错。
-- **置信区间**：query-level bootstrap 1,000 次，避免把同一 query 的多个 pair 当作独立样本。
-- **显著性**：主方法与最强 baseline 做非人类 tie pair 的 McNemar 检验；同时保存 `mccr_vs_paor.json`。
-- **成本**：报告 LLM 调用、输入/输出 tokens 和墙钟时间。`direct_k` 只近似匹配理论调用数，MCCR 的基础预算为每 query `19 + 待测 response 数`，重试和 fallback 另计。
-- **Pointwise logprob 公平性**：Pointwise 当前暂停。恢复比较时，所有方法必须使用一致的 logprob/软期望协议；只要有一个方法不能提供可比 logprob，则所有方法统一使用离散分数，禁止 MCCR/PAOR 用软期望而 baseline 用离散值直接比较。
-
-## 6. 缓存与诊断
-
-- MCCR、PAOR 使用不同的 method/cache namespace。
-- 每个 query 保存累计调用/token `cost_checkpoint`，每个方法保存累计墙钟 checkpoint；断点恢复只加新进程增量，正式成本覆盖从冷启动开始的全部尝试。
-- 缓存签名绑定生成器、裁判、弱探测、嵌入模型、长度、N/L 和全部选择/聚合超参数；配置不一致时不复用。
-- 保存多视图全集、簇成员、medoid、支持度、核心/候选/入选集合、F 矩阵、残差、目标原子分数和 raw judge 输出。
-- baseline 保存逐 aspect/criterion 原始输出；direct/dynamic 保存逐顺序投票与原始输出。
-- 诊断写入当前 output root 内，避免跨实验覆盖。
-
-## 7. 当前实验边界
-
-- 当前只运行 Pairwise，seed0；CI 不是跨 seed 方差。
-- 默认 MCCR 超参数来自 `new_our_method.md`，在正式声称优于 PAOR 前必须完成同协议对照；不能仅凭公式推断改进。
-- 尚未完成 MCCR 的系统开发集调参、跨 seed 实验和独立长文压力测试。
-- LongJudgeBench 等长文数据需要单独的上下文预算，不与当前 8K/4K 协议混跑。
-- 旧 `outputs/main*`、`outputs/full_pairwise_qwen` 只作历史归档。
+- 本仓库的测试只覆盖逻辑（用脚本化的假模型池），**尚无任何真实模型结果**。任何关于方法优劣的结论都需要按 `EXPERIMENT_SETUP.md` 实际运行后再下。
+- RRD、OpenRubrics CRG、Chasing the Tail RTD、SPCT 均为按论文描述的 prompt 版复现，与原文的偏差列在 `docs/BASELINES.md`。
+- 长文评测（LongJudgeBench 等）需要单独的上下文预算，不与当前 8K/4K 协议混跑。Pointwise 仍暂停。

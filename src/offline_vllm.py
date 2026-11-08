@@ -206,6 +206,8 @@ class OfflineLLMPool:
                 self.stats[tag]["prompt_tokens"] += int(value["prompt_tokens"])
                 self.stats[tag]["completion_tokens"] += int(value["completion_tokens"])
                 self.stats[tag]["seconds"] += elapsed
+                self.stats[tag][f"tokens:{role}"] = self.stats[tag].get(f"tokens:{role}", 0) + int(value["prompt_tokens"]) + int(value["completion_tokens"])
+                self.stats[tag][f"calls:{role}"] = self.stats[tag].get(f"calls:{role}", 0) + 1
             output.append((index, LLMResult(str(value["text"]), value["logprobs"], int(value["prompt_tokens"]),
                                             int(value["completion_tokens"]), elapsed, f"offline:{role}",
                                             finish_reason=value.get("finish_reason"))))

@@ -1,6 +1,8 @@
 
 # 方法规范：基于多视图聚类共识与残差正交筛选的动态准则生成 (MCCR-Eval)
 
+> **2026-11-08 修订说明。** 第 1–3 节是 MCCR v1（代码中的 `mccr`）的原始规范，已删去不成立的“严格最小 / 无冗余”断言，改为经验性描述。审查结论见 `docs/MCCR_REVIEW.md`。第 4 节新增 **MCCR v2**（`mccr_v2`）：方向性弱监督筛选、白化加权和可证明的词典序聚合。两个版本共享第 2.1–2.2 节的多视图生成与聚类；评测协议（离散分数、解析失败计错、共享探测）见 `method.md`。
+
 ## 1. 核心思想与第一性原理动机
 
 在构建针对用户指令 $q$ 的动态评估准则（Rubrics）时，理想的准则集合应当由两部分构成：**最小证据覆盖集（Minimal Evidence Coverage, $\mathcal{R}_{\text{core}}$）**与**响应触发的判别补充集（Response-Triggered Supplementary Rubrics, $\mathcal{R}_{\text{ext}}$）**。
@@ -12,8 +14,8 @@
 
 为解决这一问题，我们将准则构建形式化为一个**“多视图采样 $\rightarrow$ 语义空间聚类分流 $\rightarrow$ 实证残差正交筛选”**的三阶段数学过程：
 
-* **跨视图不变性导出“最小证据覆盖”**：分别基于纯指令 $(q)$ 以及指令配对不同候选回答 $(q, y_m)$ 生成多个版本的原子准则集合。将这些多视角准则投射到同一语义空间进行聚类后，**在多个视图中被高频共同生成的簇（Consensus Clusters）**天然对应了跨越具体回答的不变核心要求；而**每个簇仅提取唯一簇心代表元（Medoid）**，则在代数与语义上严格保证了“无冗余的最小基”。
-* **低频长尾簇结合实证方差导出“额外判别准则”**：仅在特定 $(q, y_m)$ 视图中被激发出来的低频簇，天然捕获了特定回答的独有亮点或隐蔽缺陷。通过在候选回答得分矩阵上执行 Gram-Schmidt 正交残差投影，滤除无区分度的生成噪声，即可提炼出真正高判别力的额外准则集。
+* **跨视图不变性导出“最小证据覆盖”**：分别基于纯指令 $(q)$ 以及指令配对不同候选回答 $(q, y_m)$ 生成多个版本的原子准则集合。将这些多视角准则投射到同一语义空间进行聚类后，**在多个视图中被高频共同生成的簇（Consensus Clusters）**天然对应了跨越具体回答的不变核心要求；而**每个簇仅提取唯一簇心代表元（Medoid）**，则在经验上去除了大部分同义重复。这只是**近似去重**：余弦阈值聚类不能识别蕴涵关系，可能把字面相近但语义相反的准则（如“≤100 词”与“≤200 词”）合并，也可能保留同义但措辞差异大的准则。
+* **低频长尾簇结合实证方差导出“额外判别准则”**：仅在特定 $(q, y_m)$ 视图中被激发出来的低频簇，**可能**捕获特定回答的独有亮点或隐蔽缺陷，但也包含偶然噪声。v1 在探测得分矩阵上执行 Gram-Schmidt 正交残差投影，试图滤除无区分度的噪声；注意探测间的方差并不等于“区分质量好坏”的能力（见第 4 节）。
 
 ---
 
@@ -58,7 +60,7 @@ $$
 \bar{r}_c = \arg\max_{r \in G_c} \frac{1}{\vert{}G_c\vert{}} \sum_{r' \in G_c} \langle \phi(r), \phi(r') \rangle
 $$
 
-这一步将 $N$ 条混杂准则压缩为 $C$ 条语义上彼此独立（无蕴涵冗余）的候选基底 $\{\bar{r}_1, \dots, \bar{r}_C\}$。
+这一步将 $N$ 条混杂准则压缩为 $C$ 条经验上去重后的候选准则 $\{\bar{r}_1, \dots, \bar{r}_C\}$。
 
 #### 2. 跨视图支持度计算与“核心-额外”集合分流
 
@@ -77,7 +79,7 @@ $$
   \mathcal{R}_{\text{core}} = \left\{ \bar{r}_c \ \middle\vert{}\ \rho(G_c) \ge \tau_{\text{core}}, \ c \in \{1, \dots, C\} \right\}
   $$
 
-  *数学性质：* $\mathcal{R}_{\text{core}}$ 中的每一条准则要么同时被先验视图与响应视图双重确认，要么在绝大多数候选回答视图中均被独立提取为必要条件；且由于每个簇仅保留唯一代表元 $\bar{r}_c$，$\mathcal{R}_{\text{core}}$ 在保证覆盖完备性的同时严格达到了基数最小化（Minimal & Non-redundant）。
+  *数学性质：* $\mathcal{R}_{\text{core}}$ 中的每一条准则要么同时被先验视图与响应视图双重确认，要么在绝大多数候选回答视图中均被独立提取为必要条件；每个簇只保留一个代表元 $\bar{r}_c$，因此 $\mathcal{R}_{\text{core}}$ 的规模受簇数约束；但覆盖完备性与最小性都**没有保证**。还需注意：在 $\beta=0.4,\tau_{\text{core}}=0.5,M=6$ 时，含先验成员的簇只需再被 1 个响应视图命中（$\rho=0.4+0.6/6=0.5$）即可入核，而不含先验成员的簇需要 $\ge 5/6$ 的响应视图支持，因此 core 在结构上接近“被回声一次的先验准则”。这一点需要用 `src/mccr_diagnostics.py` 的 `core_share_prior_echoed_once` 实测。
 * **响应衍生候选池（Response-Triggered Candidate Pool, $\tilde{\mathcal{R}}_{\text{ext}}$）**：
   $$
   \tilde{\mathcal{R}}_{\text{ext}} = \left\{ \bar{r}_c \ \middle\vert{}\ \rho(G_c) < \tau_{\text{core}}, \ c \in \{1, \dots, C\} \right\}
@@ -102,7 +104,7 @@ $$
 \mathbf{V}_{\text{core}} = \mathbf{H}\mathbf{F}_{\text{core}}, \quad \mathbf{V}_{\text{ext}} = \mathbf{H}\mathbf{F}_{\text{ext}}
 $$
 
-此时，任意候选准则 $r_p \in \tilde{\mathcal{R}}_{\text{ext}}$ 对应的中心化列向量 $\tilde{\mathbf{v}}_p$ 的二范数平方严格正比于其在候选回答上的经验方差：$\frac{1}{M}\Vert{}\tilde{\mathbf{v}}_p\Vert{}_2^2 = \text{Var}_{y \in \mathcal{Y}}[f(y, r_p)]$。
+此时，任意候选准则 $r_p \in \tilde{\mathcal{R}}_{\text{ext}}$ 对应的中心化列向量 $\tilde{\mathbf{v}}_p$ 的二范数平方等于 $M$ 倍的经验方差：$\frac{1}{M}\Vert{}\tilde{\mathbf{v}}_p\Vert{}_2^2 = \text{Var}_{y \in \mathcal{Y}}[f(y, r_p)]$。
 
 #### 2. Gram-Schmidt 正交补空间投影与贪心选择
 
@@ -198,3 +200,61 @@ $$
 4. [阶段四：门控分层效用计算]
    按公式计算每个回答的 S_core(y_m)、S_ext(y_m) 与最终效用 U(y_m) = S_core(y_m) + eta * S_core(y_m)^gamma * S_ext(y_m)。
 ```
+
+
+---
+
+## 4. MCCR v2：方向性弱监督筛选与可证明的分层聚合（`mccr_v2`）
+
+### 4.1 v1 的三个结构性问题
+
+1. **秩约束。** 中心化后的探测矩阵秩 $\le M-1=5$。core 常有 3–6 条，$\mathrm{rank}(\mathbf{V}_{\text{core}})$ 往往已占满正交补，残差 $\mathbf{e}_p\approx 0$，导致 $L'=0$。此时 v1 退化为只用 core。
+2. **方差 ≠ 判别力。** v1 的目标 $\alpha_p\|\mathbf{e}_p\|^2/M$ 是无监督的。探测由强、弱模型交替生成，方差最大的方向往往是两模型之间的风格、长度差异，与质量无关；而且同一条准则即使与质量**负相关**（例如偏好冗长），也会被选中。
+3. **门控没有保证。** $U=S_{\text{core}}+\eta S_{\text{core}}^{\gamma}S_{\text{ext}}$ 中，补充项可以抵消 core 上的小缺陷，与“核心要求优先”的主张不一致。
+
+### 4.2 已知方向的探测对
+
+设评分行集合为 $\mathcal{Y}=\{y_1,\dots,y_M\}\cup\{\tilde y_1,\dots,\tilde y_K\}$，其中 $\tilde y_k$ 是对强生成器探测 $y_{s(k)}$ 的**反事实降级**：由生成器改写，只注入**一个**实质缺陷（违反一条显式约束、篡改关键事实或计算、遗漏必要部分、错误地拒绝或顺从），其余长度、语气和格式保持不变（`PROMPT_COUNTERFACTUAL`）。由此得到“已知更好 ≻ 已知更差”的有序对集合
+
+$$
+\mathcal{P}=\underbrace{\{(i,j): y_i\in\mathcal{Y}_G,\ y_j\in\mathcal{Y}_W\}}_{\text{强≻弱（弱监督）}}\ \cup\ \underbrace{\{(s(k),\tilde k)\}}_{\text{原始≻反事实}} .
+$$
+
+反事实对控制了风格变量，因此对齐信号来自内容质量，而不是模型风格。
+
+### 4.3 方向对齐与核心过滤
+
+对每条 medoid 准则 $r$，定义方向对齐度
+
+$$
+a_r=\frac{1}{|\mathcal{P}|}\sum_{(i,j)\in\mathcal{P}}\bigl(f(y_i,r)-f(y_j,r)\bigr)\in[-1,1].
+$$
+
+$a_r<-\tau_{\text{align}}$ 的 core 准则判为**错向**，从 core 中移除（RRD 只用强/弱对做硬过滤，这里推广为连续量，并加入反事实对）。
+
+### 4.4 补充准则的对比式选择
+
+候选按 $a_p$ 降序贪心选择，入选条件为 $a_p\ge\tau_{\text{align}}$；另做共线性检验：若中心化得分向量 $\mathbf{v}_p$ 在当前基 $\mathcal{B}$ 正交补中的能量占比
+$\|(\mathbf{I}-\mathcal{B}\mathcal{B}^\top)\mathbf{v}_p\|^2/\|\mathbf{v}_p\|^2<1-\kappa$（默认 $\kappa=0.9$），则视为与已有准则重复并跳过。共线性检验在行数很少时依然有意义，不像残差方差阈值那样会因秩饱和而失效。
+
+### 4.5 权重与聚合
+
+- **core 权重**：$\mathbf{w}\propto\hat\Sigma^{-1/2}\mathbf{1}$，其中 $\hat\Sigma$ 是 core 得分在全部评分行上的 Ledoit–Wolf 收缩协方差，负权重截断为 0 后归一化。这对应 RRD 的白化加权（WU）；收缩是必需的，因为 $M+K<|\mathcal{R}_{\text{core}}|$ 时样本协方差奇异。
+- **补充权重**：与 $a_p$ 成正比。
+- **词典序聚合**：
+$$
+U(y)=S_{\text{core}}(y)+c\cdot\frac{\min_k w_k}{2}\,S_{\text{ext}}(y),\qquad 0<c<1 .
+$$
+**命题。** 当准则分数取值于 $\{0,\tfrac12,1\}$ 时，若 $S_{\text{core}}(y)>S_{\text{core}}(y')$，则 $U(y)>U(y')$。
+*证明。* core 分数差至少为 $\min_k w_k/2$，而补充项之差最多为 $c\min_k w_k/2<\min_k w_k/2$。∎
+均匀权重下即为 PAOR 的 $c/(2K)$ 缺陷带。在 logprob 软分数下该命题不成立，这也是默认使用离散分数的原因之一。
+
+### 4.6 需要通过实验检验的假设
+
+- **H1 覆盖。** 共识聚类应提高对专家准则的召回率（RubricBench 专家准则召回，`src/rubric_recall.py`）。
+- **H2 核心优先。** 词典序聚合应在“表面好、核心错”的对抗样本上更稳健（LLMBar Adversarial、RM-Bench Hard）。
+- **H3 方向性选择。** 对比式选择应优于残差方差选择、随机选择和全选（消融），且准确率提升不能仅靠增加调用（准确率–算力曲线）。
+
+### 4.7 默认超参数
+
+`theta_sim=0.80, tau_core=0.50, beta=0.40`（与 v1 相同），`n_counterfactual=3, tau_align=0.05, kappa=0.9, c=0.8, L=4`。v2 去掉了 v1 的 `tau_var, rho_min, gamma, eta`，因此需要调的超参数少于 v1。所有超参数只在 RewardBench 2 / HelpSteer3 的 dev 划分上确定，之后在全部数据集上冻结使用。

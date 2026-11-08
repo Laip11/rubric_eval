@@ -13,7 +13,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-PAIRWISE = {"rewardbench2", "helpsteer3", "rewardbench", "judgebench_gpt", "judgebench_claude", "alpacaeval", "mtbench", "biggen"}
+PAIRWISE = {"rewardbench2", "helpsteer3", "rewardbench", "judgebench_gpt", "judgebench_claude", "alpacaeval", "mtbench", "biggen",
+            "rubricbench", "llmbar", "rmbench", "ppe"}
 POINTWISE = {"helpsteer2", "biggen_pointwise", "healthbench"}
 BENCHMARKS = [*sorted(PAIRWISE), "helpsteer2", "biggen_pointwise", "healthbench"]
 
@@ -324,6 +325,97 @@ def load_healthbench(root: Path) -> list[dict[str, Any]]:
     return items
 
 
+RUBRICBENCH_GROUPS = {"chat": {"general", "focus", "human-preference", "factuality", "helpful"},
+                      "if": {"precise if", "ifeval"}, "stem": {"stem", "math", "mmlu-pro", "gpqa"},
+                      "code": {"mbpp", "code"}, "safety": {"safety", "harmlessness"}}
+
+
+def rubricbench_group(domain: str) -> str:
+    domain = str(domain).strip().lower()
+    return next((group for group, members in RUBRICBENCH_GROUPS.items() if domain in members), "other")
+
+
+def load_rubricbench(root: Path) -> list[dict[str, Any]]:
+    """RubricBench (arXiv:2603.01562): 1,147 pairs with expert atomic rubrics; label 0 = response_a better."""
+    path = root / "rubricbench" / "train.parquet"
+    _check_payload(path)
+    records = []
+    for _, row in pd.read_parquet(path).iterrows():
+        label = int(row["label"])
+        if label not in (0, 1):
+            raise ValueError(f"Unexpected RubricBench label {label} for {row['case_id']}")
+        rubrics = [line.strip() for line in str(row["rubrics"]).split("\n") if line.strip()]
+        records.append(_pair(
+            f"rubricbench:{row['case_id']}", str(row["instruction"]), str(row["response_a"]), str(row["response_b"]),
+            "A" if label == 0 else "B", subset=rubricbench_group(row["domain"]), domain=str(row["domain"]),
+            source=str(row["source"]), case_id=str(row["case_id"]), expert_rubrics=rubrics,
+            evaluation_protocol="official_rubricbench_pairwise"))
+    return records
+
+
+LLMBAR_SUBSETS = ["Natural", "Adversarial_Neighbor", "Adversarial_GPTInst", "Adversarial_GPTOut", "Adversarial_Manual"]
+
+
+def load_llmbar(root: Path) -> list[dict[str, Any]]:
+    """LLMBar (ICLR 2024): Natural + four Adversarial subsets; label 1 = output_1 better."""
+    records = []
+    for subset in LLMBAR_SUBSETS:
+        path = root / "llmbar" / subset / "dataset.json"
+        _check_payload(path)
+        for index, row in enumerate(_read_json(path)):
+            label = int(row["label"])
+            if label not in (1, 2):
+                raise ValueError(f"Unexpected LLMBar label {label} in {subset}")
+            records.append(_pair(f"llmbar:{subset}:{index:04d}", str(row["input"]), str(row["output_1"]),
+                                 str(row["output_2"]), "A" if label == 1 else "B", subset=subset,
+                                 evaluation_protocol="official_llmbar_pairwise"))
+    return records
+
+
+def load_rmbench(root: Path) -> list[dict[str, Any]]:
+    """RM-Bench (ICLR 2025): 3 chosen x 3 rejected style variants per prompt (0 concise, 1 detailed, 2 markdown).
+
+    All 9 (chosen_i, rejected_j) pairs are kept; metrics.py reports the official hard (i < j),
+    normal (i = j) and easy (i > j) accuracies and their domain average.
+    """
+    path = root / "rmbench" / "total_dataset.json"
+    _check_payload(path)
+    records = []
+    for row in _read_json(path):
+        chosen, rejected = [str(x) for x in row["chosen"]], [str(x) for x in row["rejected"]]
+        if len(chosen) != 3 or len(rejected) != 3:
+            raise ValueError(f"Unexpected RM-Bench shape for {row['id']}")
+        domain = str(row["domain"])
+        qid = f"rmbench:{row['id']}"
+        for i, good in enumerate(chosen):
+            for j, bad in enumerate(rejected):
+                if good == bad:
+                    continue
+                swapped = int(_digest(f"{qid}:{i}:{j}"), 16) % 2 == 1
+                records.append(_pair(qid, str(row["prompt"]), bad if swapped else good, good if swapped else bad,
+                                     "B" if swapped else "A", subset=domain.split("-")[0], domain=domain,
+                                     style_chosen=i, style_rejected=j, orientation_swapped=swapped,
+                                     evaluation_protocol="official_rmbench_style_matrix"))
+    return records
+
+
+def load_ppe(root: Path) -> list[dict[str, Any]]:
+    """PPE human preference v1 (ICLR 2025): Chatbot Arena pairs; ties and both-bad are excluded (10,216 pairs)."""
+    path = root / "ppe" / "human_preference_v1_test.parquet"
+    _check_payload(path)
+    records = []
+    for _, row in pd.read_parquet(path).iterrows():
+        if row["winner"] not in ("model_a", "model_b") or row["response_1"] == row["response_2"]:
+            continue
+        subset = ("code" if row["is_code"] else "math" if row["math_prompt"] else
+                  "if" if row["if_prompt"] else "hard" if row["hard_prompt"] else "general")
+        records.append(_pair(f"ppe:{row['question_id']}", str(row["prompt"]), str(row["response_1"]),
+                             str(row["response_2"]), "A" if row["winner"] == "model_a" else "B", subset=subset,
+                             language=str(row["language"]), model_a=str(row["model_a"]), model_b=str(row["model_b"]),
+                             evaluation_protocol="official_ppe_human_preference"))
+    return records
+
+
 def load_records(benchmark: str, data_root: str | Path) -> list[dict[str, Any]]:
     root = Path(data_root)
     loaders = {"rewardbench2": load_rewardbench2, "helpsteer3": load_helpsteer3,
@@ -331,7 +423,8 @@ def load_records(benchmark: str, data_root: str | Path) -> list[dict[str, Any]]:
                "judgebench_claude": load_judgebench_claude,
                "alpacaeval": load_alpacaeval, "mtbench": load_mtbench, "biggen": load_biggen,
                "biggen_pointwise": load_biggen_pointwise, "helpsteer2": load_helpsteer2,
-               "healthbench": load_healthbench}
+               "healthbench": load_healthbench, "rubricbench": load_rubricbench, "llmbar": load_llmbar,
+               "rmbench": load_rmbench, "ppe": load_ppe}
     if benchmark not in loaders:
         raise ValueError(f"Unknown benchmark {benchmark}; choose from {sorted(loaders)}")
     return loaders[benchmark](root)
@@ -413,7 +506,7 @@ def split_qids(groups: list[dict[str, Any]], output_dir: str | Path, seed: int =
 
 
 def select_groups(groups: list[dict[str, Any]], splits: dict[str, list[str]], split: str = "test", max_queries: int | None = None) -> list[dict[str, Any]]:
-    allowed = set(splits[split])
+    allowed = set(splits["dev"]) | set(splits["test"]) if split == "all" else set(splits[split])
     selected = [group for group in groups if group["qid"] in allowed]
     if max_queries is not None:
         selected = selected[:max_queries]
