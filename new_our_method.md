@@ -1,0 +1,200 @@
+
+# 方法规范：基于多视图聚类共识与残差正交筛选的动态准则生成 (MCCR-Eval)
+
+## 1. 核心思想与第一性原理动机
+
+在构建针对用户指令 $q$ 的动态评估准则（Rubrics）时，理想的准则集合应当由两部分构成：**最小证据覆盖集（Minimal Evidence Coverage, $\mathcal{R}_{\text{core}}$）**与**响应触发的判别补充集（Response-Triggered Supplementary Rubrics, $\mathcal{R}_{\text{ext}}$）**。
+
+从第一性原理出发，直接依赖单次 Prompt 让模型生成“最小完备覆盖”存在两个固有缺陷：
+
+1. **单视角盲区与冗余并存**：仅看指令 $q$（零样本先验）容易遗漏只有在具体回答语境下才会显现的隐性必要约束；而引入回答 $(q, y_m)$ 后，模型又会产生大量同义反复或被单一回答带偏的噪声准则。
+2. **主干与分支的界限模糊**：哪些准则是所有回答都必须满足的“及格底线”，哪些准则是区分高下或捕获特定缺陷的“额外检验”，无法仅凭文本表征直接切分。
+
+为解决这一问题，我们将准则构建形式化为一个**“多视图采样 $\rightarrow$ 语义空间聚类分流 $\rightarrow$ 实证残差正交筛选”**的三阶段数学过程：
+
+* **跨视图不变性导出“最小证据覆盖”**：分别基于纯指令 $(q)$ 以及指令配对不同候选回答 $(q, y_m)$ 生成多个版本的原子准则集合。将这些多视角准则投射到同一语义空间进行聚类后，**在多个视图中被高频共同生成的簇（Consensus Clusters）**天然对应了跨越具体回答的不变核心要求；而**每个簇仅提取唯一簇心代表元（Medoid）**，则在代数与语义上严格保证了“无冗余的最小基”。
+* **低频长尾簇结合实证方差导出“额外判别准则”**：仅在特定 $(q, y_m)$ 视图中被激发出来的低频簇，天然捕获了特定回答的独有亮点或隐蔽缺陷。通过在候选回答得分矩阵上执行 Gram-Schmidt 正交残差投影，滤除无区分度的生成噪声，即可提炼出真正高判别力的额外准则集。
+
+---
+
+## 2. 数学形式化与方法建模 (Mathematical Formulation)
+
+### 2.1 阶段一：多视图原子准则采样 (Multi-View Atomic Rubric Sampling)
+
+给定用户指令 $q$ 以及一组包含 $M$ 个候选（或探测）响应的集合 $\mathcal{Y} = \{y_1, y_2, \dots, y_M\}$。我们构造 $M+1$ 个观测视图来激发原子评估准则：
+
+1. **先验无偏视图（Prior View, $m=0$）**：仅输入指令 $q$，采样生成初始原子准则集：
+   $$
+   \mathcal{R}^{(0)} = \left\{ r_{0, 1}, r_{0, 2}, \dots, r_{0, n_0} \right\} \sim \mathbb{P}_{\mathcal{G}}(\mathcal{R} \mid q)
+   $$
+2. **响应锚定视图（Response-Grounded Views, $m=1, \dots, M$）**：依次将指令 $q$ 与第 $m$ 个候选回答 $y_m$ 配对（或将回答划分为若干子视图），引导生成模型审视 $y_m$ 的具体表现与潜在缺陷，独立生成第 $m$ 个版本的原子准则集：
+   $$
+   \mathcal{R}^{(m)} = \left\{ r_{m, 1}, r_{m, 2}, \dots, r_{m, n_m} \right\} \sim \mathbb{P}_{\mathcal{G}}(\mathcal{R} \mid q, y_m), \quad \forall m \in \{1, \dots, M\}
+   $$
+
+将全部 $M+1$ 个视图生成的原子准则取并集，构成原始多视图准则全集 $\mathcal{U}$：
+
+$$
+\mathcal{U} = \bigcup_{m=0}^M \mathcal{R}^{(m)}, \quad N = \vert{}\mathcal{U}\vert{} = \sum_{m=0}^M n_m
+$$
+
+---
+
+### 2.2 阶段二：语义聚类分流与最小证据覆盖提取 (Semantic Clustering & Core-Residual Split)
+
+原始全集 $\mathcal{U}$ 中包含大量跨视图重复的等价准则。设 $\phi: \mathcal{U} \to \mathbb{S}^{d-1}$ 为单位球面上的语义嵌入映射（或基于自然语言推理的等价核函数），定义准则 $r_i, r_j \in \mathcal{U}$ 之间的语义相似度为 $S_{\text{sem}}(r_i, r_j) = \langle \phi(r_i), \phi(r_j) \rangle$。
+
+#### 1. 凝聚层次聚类与正交簇心提取
+
+以相似度阈值 $\theta_{\text{sim}} \in (0, 1)$（如 $\theta_{\text{sim}} = 0.80$）对 $\mathcal{U}$ 执行凝聚层次聚类（Agglomerative Clustering），将 $\mathcal{U}$ 划分为 $C$ 个互不相交的语义等价簇 $\mathcal{G} = \{G_1, G_2, \dots, G_C\}$：
+
+$$
+\mathcal{U} = \bigsqcup_{c=1}^C G_c, \quad \text{满足 } \forall c \neq c', \ \text{Sim}(G_c, G_{c'}) < \theta_{\text{sim}}
+$$
+
+对于每个簇 $G_c$，选取簇内与其他成员平均语义相似度最高的准则作为该簇的**唯一代表元（Medoid Rubric）** $\bar{r}_c$：
+
+$$
+\bar{r}_c = \arg\max_{r \in G_c} \frac{1}{\vert{}G_c\vert{}} \sum_{r' \in G_c} \langle \phi(r), \phi(r') \rangle
+$$
+
+这一步将 $N$ 条混杂准则压缩为 $C$ 条语义上彼此独立（无蕴涵冗余）的候选基底 $\{\bar{r}_1, \dots, \bar{r}_C\}$。
+
+#### 2. 跨视图支持度计算与“核心-额外”集合分流
+
+为了区分哪些准则是必选的“最小证据覆盖”，哪些是由特定回答激发的“额外候选准则”，我们定义簇 $G_c$ 的**跨视图共识支持度（Cross-View Consensus Support）** $\rho(G_c) \in [0, 1]$：
+
+$$
+\rho(G_c) = \beta \cdot \mathbb{I}\left(G_c \cap \mathcal{R}^{(0)} \neq \emptyset\right) + (1 - \beta) \cdot \frac{1}{M} \sum_{m=1}^M \mathbb{I}\left(G_c \cap \mathcal{R}^{(m)} \neq \emptyset\right)
+$$
+
+其中 $\mathbb{I}(\cdot)$ 为示性函数，衡量该簇是否在第 $m$ 个视图中被独立提出；$\beta \in (0, 1)$ 为先验视图的锚定权重（默认取 $\beta = 0.4$）。
+
+给定共识阈值 $\tau_{\text{core}}$（例如 $\tau_{\text{core}} = 0.5$），准则簇自然分流为两个互补的子集：
+
+* **最小证据覆盖集（Minimal Evidence Coverage Set, $\mathcal{R}_{\text{core}}$）**：
+  $$
+  \mathcal{R}_{\text{core}} = \left\{ \bar{r}_c \ \middle\vert{}\ \rho(G_c) \ge \tau_{\text{core}}, \ c \in \{1, \dots, C\} \right\}
+  $$
+
+  *数学性质：* $\mathcal{R}_{\text{core}}$ 中的每一条准则要么同时被先验视图与响应视图双重确认，要么在绝大多数候选回答视图中均被独立提取为必要条件；且由于每个簇仅保留唯一代表元 $\bar{r}_c$，$\mathcal{R}_{\text{core}}$ 在保证覆盖完备性的同时严格达到了基数最小化（Minimal & Non-redundant）。
+* **响应衍生候选池（Response-Triggered Candidate Pool, $\tilde{\mathcal{R}}_{\text{ext}}$）**：
+  $$
+  \tilde{\mathcal{R}}_{\text{ext}} = \left\{ \bar{r}_c \ \middle\vert{}\ \rho(G_c) < \tau_{\text{core}}, \ c \in \{1, \dots, C\} \right\}
+  $$
+
+  *数学性质：* $\tilde{\mathcal{R}}_{\text{ext}}$ 中的准则仅在少数特定回答视图 $(q, y_m)$ 中被激发，代表了针对特定回答亮点的拔高检验或针对局部缺陷的专门排查。
+
+---
+
+### 2.3 阶段三：基于实证得分矩阵的残差正交筛选 (Empirical Orthogonal Residual Filtering)
+
+候选池 $\tilde{\mathcal{R}}_{\text{ext}}$ 中既包含高价值的判别准则，也混杂着个别视图产生的偶然噪声。我们通过候选响应集合 $\mathcal{Y} = \{y_1, \dots, y_M\}$ 上的**实证评估矩阵**来提纯真正的额外准则 $\mathcal{R}_{\text{ext}} \subset \tilde{\mathcal{R}}_{\text{ext}}$。
+
+设 Judge 算子对响应 $y_m$ 在准则 $r$ 上的打分为 $f(y_m, r) \in [0, 1]$。
+记 $\mathcal{R}_{\text{core}}$（共 $K$ 条）在 $\mathcal{Y}$ 上的得分矩阵为 $\mathbf{F}_{\text{core}} \in [0, 1]^{M \times K}$；记 $\tilde{\mathcal{R}}_{\text{ext}}$（共 $P$ 条）在 $\mathcal{Y}$ 上的得分矩阵为 $\mathbf{F}_{\text{ext}} \in [0, 1]^{M \times P}$。
+
+#### 1. 列向量去均值中心化 (Centering)
+
+定义中心化算子 $\mathbf{H} = \mathbf{I}_M - \frac{1}{M}\mathbf{1}_M\mathbf{1}_M^\top$，将得分矩阵转换为零均值判别剖面矩阵：
+
+$$
+\mathbf{V}_{\text{core}} = \mathbf{H}\mathbf{F}_{\text{core}}, \quad \mathbf{V}_{\text{ext}} = \mathbf{H}\mathbf{F}_{\text{ext}}
+$$
+
+此时，任意候选准则 $r_p \in \tilde{\mathcal{R}}_{\text{ext}}$ 对应的中心化列向量 $\tilde{\mathbf{v}}_p$ 的二范数平方严格正比于其在候选回答上的经验方差：$\frac{1}{M}\Vert{}\tilde{\mathbf{v}}_p\Vert{}_2^2 = \text{Var}_{y \in \mathcal{Y}}[f(y, r_p)]$。
+
+#### 2. Gram-Schmidt 正交补空间投影与贪心选择
+
+为确保选出的额外准则不仅具有高区分度（高方差），而且不会与最小证据覆盖集 $\mathcal{R}_{\text{core}}$ 或已选额外准则产生评分共线性（防止同一个优缺点被换个说法重复计分），我们提取 $\text{span}(\mathbf{V}_{\text{core}})$ 的标准正交基矩阵 $\mathcal{B}_0$（通过精简 SVD 分解获得）。
+
+在第 $t = 1, \dots, L$ 步迭代中，对于每个未选中的候选准则 $r_p \in \tilde{\mathcal{R}}_{\text{ext}}$，将其中心化得分向量 $\tilde{\mathbf{v}}_p$ 投影至当前标准正交基 $\mathcal{B}_{t-1}$ 的**正交补空间**：
+
+$$
+\mathbf{e}_p^{(t-1)} = \left(\mathbf{I}_M - \mathcal{B}_{t-1}\mathcal{B}_{t-1}^\top\right)\tilde{\mathbf{v}}_p
+$$
+
+残差向量的均方模长 $\sigma_p^2(t) = \frac{1}{M}\Vert{}\mathbf{e}_p^{(t-1)}\Vert{}_2^2$ 度量了准则 $r_p$ 在剥离掉现有准则影响后，所能提供的**纯净未解释判别方差（Unexplained Discriminative Variance）**。
+
+结合该簇的原始视图支持度权重 $\alpha_p = \max(\rho(G_p), \rho_{\min})$，每一步贪心选择残差能量最大的候选准则：
+
+$$
+p^* = \arg\max_{p} \ \alpha_p \cdot \frac{1}{M}\left\Vert{}\mathbf{e}_p^{(t-1)}\right\Vert{}_2^2
+$$
+
+若 $\frac{1}{M}\Vert{}\mathbf{e}_{p^*}^{(t-1)}\Vert{}_2^2 < \tau_{\text{var}}$（残差方差低于阈值，说明已无新的区分信息），则提前终止选择；否则将 $r_{p^*}$ 并入最终额外准则集 $\mathcal{R}_{\text{ext}}$，并将单位化残差方向 $\mathbf{u}_t = \mathbf{e}_{p^*}^{(t-1)} / \Vert{}\mathbf{e}_{p^*}^{(t-1)}\Vert{}_2$ 扩充进正交基 $\mathcal{B}_t = [\mathcal{B}_{t-1}, \mathbf{u}_t]$。
+
+---
+
+### 2.4 阶段四：主干门控分层评分聚合 (Core-Gated Hierarchical Scoring)
+
+最终确定的评估准则集合为 $\mathcal{R}^* = \mathcal{R}_{\text{core}} \sqcup \mathcal{R}_{\text{ext}}$。为防止额外准则 $\mathcal{R}_{\text{ext}}$ 稀释最小证据覆盖集 $\mathcal{R}_{\text{core}}$ 的决定性地位，待测回答 $y$ 的总得分 $U(y \mid q)$ 采用**主干乘性门控聚合**：
+
+1. **最小证据覆盖得分（Core Coverage Score）：**
+   $$
+   S_{\text{core}}(y) = \sum_{k=1}^K w_k^{\text{core}} f\left(y, r_k^{\text{core}}\right), \quad w_k^{\text{core}} = \frac{\rho(G_k)}{\sum_{j=1}^K \rho(G_j)}
+   $$
+
+   *(共识支持度越高的核心准则，在基础分中的占比越高。)*
+2. **额外判别补充得分（Supplementary Discriminative Score）：**
+   $$
+   S_{\text{ext}}(y) = \sum_{l=1}^L w_l^{\text{ext}} f\left(y, r_l^{\text{ext}}\right), \quad w_l^{\text{ext}} = \frac{\sigma_l}{\sum_{j=1}^L \sigma_j + \epsilon}
+   $$
+
+   *(其中 $\sigma_l = \frac{1}{\sqrt{M}}\Vert{}\mathbf{e}_l^{(l-1)}\Vert{}_2$ 为第 $l$ 条额外准则入选时的残差标准差。)*
+3. **门控合成总效用（Gated Total Utility）：**
+   $$
+   U(y \mid q) = S_{\text{core}}(y) + \eta \cdot \left[S_{\text{core}}(y)\right]^\gamma \cdot S_{\text{ext}}(y)
+   $$
+
+   其中 $\gamma \ge 1$ 为门控指数（默认 $\gamma = 2.0$），$\eta \in (0, 1]$ 为补充项缩放系数（默认 $\eta = 0.5$）。当回答未满足最小证据覆盖时（$S_{\text{core}}(y) \ll 1$），门控因子 $[S_{\text{core}}(y)]^\gamma$ 迅速衰减趋近于 0，阻断额外加分项的干扰；仅当回答充分满足最小证据覆盖（$S_{\text{core}}(y) \to 1$）时，$\mathcal{R}_{\text{ext}}$ 才全额介入以拉开高质量回答之间的档次差距。
+
+---
+
+## 3. 算法伪代码与核心实现逻辑
+
+### 3.1 完整算法流程 (Algorithm Block)
+
+```
+算法 1: MCCR-Eval (多视图聚类共识与残差正交准则生成算法)
+输入: 用户指令 q, 候选响应集 Y = {y_1, ..., y_M}, 
+      语义聚类阈值 theta_sim=0.80, 核心共识阈值 tau_core=0.50, 先验锚定系数 beta=0.40,
+      最大额外准则数 L=4, 残差方差阈值 tau_var=0.04, 门控参数 (gamma=2.0, eta=0.5)
+输出: 最小证据覆盖集 R_core, 额外补充准则集 R_ext, 以及各响应最终得分 {U(y_1), ..., U(y_M)}
+
+1. [阶段一：多视图原子准则生成]
+   生成先验视图准则: R^(0) <- Prompt_Prior_Atomic(q)
+   For m = 1 to M do:
+       生成响应锚定视图准则: R^(m) <- Prompt_Response_Atomic(q, y_m)
+   汇总全集 U = R^(0) U R^(1) U ... U R^(M)
+
+2. [阶段二：语义聚类与主干-残差分流]
+   计算 U 中每条准则的归一化语义向量 phi(r)。
+   基于余弦距离 (1 - <phi(r_i), phi(r_j)>) 和距离阈值 (1 - theta_sim) 执行凝聚层次聚类，得到簇 {G_1, ..., G_C}。
+   初始化 R_core = [], R_tilde_ext = []。
+   For c = 1 to C do:
+       提取簇心代表元: r_bar_c = argmax_{r in G_c} mean_{r' in G_c} <phi(r), phi(r')>
+       计算跨视图支持度: rho_c = beta * I(G_c ∩ R^(0) != empty) + (1 - beta) * (1/M) * sum_{m=1}^M I(G_c ∩ R^(m) != empty)
+       If rho_c >= tau_core then:
+           将 (r_bar_c, rho_c) 加入最小证据覆盖集 R_core
+       Else:
+           将 (r_bar_c, rho_c) 加入额外候选池 R_tilde_ext
+
+3. [阶段三：实证得分矩阵构建与正交残差筛选]
+   使用裁判模型评估 Y 在 R_core 与 R_tilde_ext 上的得分 -> 得到矩阵 F_core in [0,1]^(M x K), F_ext in [0,1]^(M x P)。
+   列中心化: V_core = H * F_core, V_ext = H * F_ext。
+   对 V_core 执行 SVD 提取标准正交基 B。
+   初始化最终额外集 R_ext = [], 权重 w_ext = []。
+   For t = 1 to L do:
+       For 每个未选中的候选 p in R_tilde_ext do:
+           e_p = (I_M - B * B^T) * V_ext[:, p]
+           var_p = ||e_p||_2^2 / M
+           score_p = max(rho_p, 0.2) * var_p
+       p* = argmax_p (score_p)
+       If var_{p*} < tau_var then Break
+       将 r_bar_{p*} 加入 R_ext，记录权重 sigma_{p*} = sqrt(var_{p*})
+       B = [B, e_{p*} / ||e_{p*}||_2]
+
+4. [阶段四：门控分层效用计算]
+   按公式计算每个回答的 S_core(y_m)、S_ext(y_m) 与最终效用 U(y_m) = S_core(y_m) + eta * S_core(y_m)^gamma * S_ext(y_m)。
+```

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+cache/
+outputs/
+
+# Upstream checkout metadata and generated eval artifacts
+generating_dynamic_rubric/.git/
+generating_dynamic_rubric/outputs/
+
+# Incomplete downloads and files over GitHub's recommended size
+*.download
+generating_dynamic_rubric/data/healthbench/2025-05-07-06-14-12_oss_meta_eval.jsonl
+generating_dynamic_rubric/data/healthbench/2025-05-07-06-14-12_oss_eval.jsonl
